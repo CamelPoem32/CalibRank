@@ -15,6 +15,9 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib import animation
+import gc
 
 
 from ..assembly import JacobianBundle
@@ -52,6 +55,12 @@ VARIABLE_MAX_RANKS = {
     "tau_I": 1,
     "tau_L": 1,
 }
+J_C_DISPLAY_COLUMN_ORDER = ("T_B_I", "b_g", "tau_I", "tau_L")
+J_C_FACTOR_FAMILY_ORDER = (
+    ("lidar", "LiDAR"),
+    ("gyro", "gyro"),
+    ("accelerometer", "accel"),
+)
 
 
 ##################################################
@@ -89,6 +98,10 @@ class QuasiRealtimeConfig:
             CRLB-like coordinate summaries.
         accelerometer_options (AccelerometerOptions | None): Optional accelerometer
             factor configuration.
+        normalize_J_C_factor_blocks_for_display (bool): Whether the displayed
+            copy of ``J_C`` is independently normalized per LiDAR, gyro, and
+            accelerometer row family. This is visualization-only and never
+            changes physical Jacobians or diagnostics.
     '''
 
     window_length: float = 6.0
@@ -108,6 +121,49 @@ class QuasiRealtimeConfig:
     coordinate_null_fraction_tolerance: float = 1e-6
     show_local_accuracy_summary: bool = True
     accelerometer_options: AccelerometerOptions | None = None
+    normalize_J_C_factor_blocks_for_display: bool = True
+
+
+@dataclass(frozen=True)
+class MatrixDisplayLayout:
+    '''Store semantic separators and labels for one displayed matrix.
+
+    Boundary values are counts in displayed coordinates. A row boundary ``b`` is
+    drawn at imshow coordinate ``y = b - 0.5``; a column boundary is drawn at
+    ``x = b - 0.5``. Empty tuples mean ordinary heatmap display without semantic
+    separators. Display rows may be downsampled independently inside each
+    semantic block.
+    '''
+
+    row_boundaries: tuple[int, ...] = ()
+    row_centers: tuple[float, ...] = ()
+    row_labels: tuple[str, ...] = ()
+    column_boundaries: tuple[int, ...] = ()
+    column_centers: tuple[float, ...] = ()
+    column_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MatrixDisplayResult:
+    '''Store a display-only matrix together with semantic layout metadata.
+
+    ``block_scales`` records any display-only normalization scales. Numerical
+    observability, information, rank, singular-value, and local-accuracy
+    calculations continue to use the physical source matrices.
+    '''
+
+    matrix: NDArray[np.float64]
+    layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
+    block_scales: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MotionMatrixFrame:
+    '''Store the motion-sensitivity heatmap selected for one animation frame.'''
+
+    matrix: NDArray[np.float64]
+    title: str
+    layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
 
 
 @dataclass
@@ -167,6 +223,11 @@ class QuasiRealtimeSnapshot:
     J_C_display: NDArray[np.float64]
     C_X_L_display: NDArray[np.float64]
     C_X_I_gyro_display: NDArray[np.float64]
+    J_C_display_layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
+    C_X_L_display_layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
+    C_X_I_gyro_display_layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
+    C_X_I_accel_display_layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
+    J_C_display_block_scales: dict[str, float] = field(default_factory=dict)
     target_O_display: dict[str, NDArray[np.float64]] = field(default_factory=dict)
     bundle: JacobianBundle | None = None
     motion_lidar: Any | None = None
@@ -491,18 +552,29 @@ def build_window_snapshot(
             max_cols=config.max_display_cols,
         )
 
-    C_X_L_display = matrix_for_display(
+    J_C_display_result = _semantic_j_c_display(
+        bundle.J_C,
+        bundle.calibration_column_slices,
+        _factor_family_row_slices(bundle),
+        max_rows=config.max_display_rows,
+        max_cols=config.max_display_cols,
+        normalize_factor_blocks=config.normalize_J_C_factor_blocks_for_display,
+    )
+    C_X_L_display_result = _c_x_display_result(
         None if motion_lidar is None else motion_lidar.C_X_L_column_normalized,
+        "lidar",
         max_rows=config.max_display_rows,
         max_cols=config.max_display_cols,
     )
-    C_X_I_gyro_display = matrix_for_display(
+    C_X_I_gyro_display_result = _c_x_display_result(
         None if motion_imu is None else motion_imu.rotation_only_normalized,
+        "gyro",
         max_rows=config.max_display_rows,
         max_cols=config.max_display_cols,
     )
-    C_X_I_accel_display = matrix_for_display(
+    C_X_I_accel_display_result = _c_x_display_result(
         None if motion_accelerometer is None else motion_accelerometer.C_X_I_accel_physical,
+        "accelerometer",
         max_rows=config.max_display_rows,
         max_cols=config.max_display_cols,
     )
@@ -516,13 +588,14 @@ def build_window_snapshot(
         machine_ranks=machine_ranks,
         effective_ranks=effective_ranks,
         condition_numbers=condition_numbers,
-        J_C_display=matrix_for_display(
-            bundle.J_C,
-            max_rows=config.max_display_rows,
-            max_cols=config.max_display_cols,
-        ),
-        C_X_L_display=C_X_L_display,
-        C_X_I_gyro_display=C_X_I_gyro_display,
+        J_C_display=J_C_display_result.matrix,
+        C_X_L_display=C_X_L_display_result.matrix,
+        C_X_I_gyro_display=C_X_I_gyro_display_result.matrix,
+        J_C_display_layout=J_C_display_result.layout,
+        C_X_L_display_layout=C_X_L_display_result.layout,
+        C_X_I_gyro_display_layout=C_X_I_gyro_display_result.layout,
+        C_X_I_accel_display_layout=C_X_I_accel_display_result.layout,
+        J_C_display_block_scales=J_C_display_result.block_scales,
         target_O_display=target_O_display,
         bundle=bundle,
         motion_lidar=motion_lidar,
@@ -540,7 +613,7 @@ def build_window_snapshot(
         accelerometer_factor_count=int(bundle.metadata.get("accelerometer_factor_count", 0)),
         accelerometer_candidate_count=int(bundle.metadata.get("accelerometer_candidate_count", 0)),
         accelerometer_gate_mask=np.asarray(bundle.metadata.get("accelerometer_gate_mask", np.zeros(0, dtype=bool)), dtype=bool),
-        C_X_I_accel_display=C_X_I_accel_display,
+        C_X_I_accel_display=C_X_I_accel_display_result.matrix,
         accelerometer_factor_terms=tuple(bundle.metadata.get("accelerometer_factor_terms", ())),
         accelerometer_jacobian_check_diagnostics=tuple(bundle.metadata.get("accelerometer_jacobian_check_results", ())),
     )
@@ -933,6 +1006,9 @@ def save_quasi_realtime_rover_animation(
     html_dpi: int = 80,
     html_frame_format: str = "jpeg",
     embed_limit_mb: float = 1000.0,
+    standalone_html: bool = False,
+    standalone_html_max_frames: int = 300,
+    save_html=True,
 ) -> Path:
     '''Save a standalone HTML animation and optionally an MP4 companion.
 
@@ -962,8 +1038,6 @@ def save_quasi_realtime_rover_animation(
         ValueError: If snapshots are empty or an animation option is invalid.
         RuntimeError: If MP4 export is requested without an FFmpeg writer.
     '''
-    import matplotlib.pyplot as plt
-    from matplotlib import animation
 
     ##################################################
     # Validate rendering options
@@ -1018,10 +1092,11 @@ def save_quasi_realtime_rover_animation(
 
     motion_frames = [_motion_matrix_for_frame(snapshot) for snapshot in rendered_snapshots]
     jacobian_shape = (max(snapshot.J_C_display.shape[0] for snapshot in rendered_snapshots), max(snapshot.J_C_display.shape[1] for snapshot in rendered_snapshots))
-    motion_shape = (max(matrix.shape[0] for matrix, _ in motion_frames), max(matrix.shape[1] for matrix, _ in motion_frames))
+    motion_shape = (max(frame.matrix.shape[0] for frame in motion_frames), max(frame.matrix.shape[1] for frame in motion_frames))
     jacobian_matrices = [_pad_animation_matrix(snapshot.J_C_display, jacobian_shape) for snapshot in rendered_snapshots]
-    motion_matrices = [_pad_animation_matrix(matrix, motion_shape) for matrix, _ in motion_frames]
-    motion_titles = [title for _, title in motion_frames]
+    motion_matrices = [_pad_animation_matrix(frame.matrix, motion_shape) for frame in motion_frames]
+    motion_titles = [frame.title for frame in motion_frames]
+    motion_layouts = [frame.layout for frame in motion_frames]
 
     ##################################################
     # Construct static artists once
@@ -1068,11 +1143,13 @@ def save_quasi_realtime_rover_animation(
     jacobian_axis.set_title("J_C")
     jacobian_axis.set_xlabel("calibration column")
     jacobian_axis.set_ylabel("display row")
+    jacobian_horizontal_lines, jacobian_vertical_lines = _create_separator_lines(jacobian_axis, 2, 3)
 
     motion_image = motion_axis.imshow(np.zeros(motion_shape, dtype=float), aspect="auto", cmap="coolwarm", vmin=-1.0, vmax=1.0)
     motion_title = motion_axis.set_title("C_X_L / C_X_I gyro")
     motion_axis.set_xlabel("sensitivity column")
     motion_axis.set_ylabel("display row")
+    motion_horizontal_lines, motion_vertical_lines = _create_separator_lines(motion_axis, 0, 3)
     figure_title = fig.suptitle("")
 
     ##################################################
@@ -1099,38 +1176,173 @@ def save_quasi_realtime_rover_animation(
 
         jacobian_matrix = jacobian_matrices[frame_index]
         J_C_image.set_data(jacobian_matrix)
-        jacobian_max_abs = max(float(np.max(np.abs(jacobian_matrix))), 1e-12)
-        J_C_image.set_clim(-jacobian_max_abs, jacobian_max_abs)
+        _update_heatmap_limits(
+            J_C_image,
+            jacobian_matrix,
+            fixed_limit=1.0 if snapshot.J_C_display_block_scales else None,
+        )
+        _update_separator_lines(jacobian_horizontal_lines, jacobian_vertical_lines, snapshot.J_C_display_layout)
+        _update_layout_ticks(jacobian_axis, snapshot.J_C_display_layout, x_fontsize=6, y_fontsize=6)
+        jacobian_axis.set_title(_j_c_display_title(snapshot))
 
         motion_matrix = motion_matrices[frame_index]
         motion_image.set_data(motion_matrix)
-        motion_max_abs = max(float(np.max(np.abs(motion_matrix))), 1e-12)
-        motion_image.set_clim(-motion_max_abs, motion_max_abs)
+        _update_heatmap_limits(motion_image, motion_matrix)
+        _update_separator_lines(motion_horizontal_lines, motion_vertical_lines, motion_layouts[frame_index])
+        _update_layout_ticks(motion_axis, motion_layouts[frame_index], x_fontsize=6, y_fontsize=6)
         motion_title.set_text(motion_titles[frame_index])
         figure_title.set_text(f"t = {snapshot.current_time:.2f} s, window = [{snapshot.window_start:.2f}, {snapshot.window_end:.2f}] s")
 
-        return traversed_line, window_line, rover_marker, heading_arrow, rank_text, *condition_lines.values(), J_C_image, motion_image, motion_title, figure_title
+        return (
+            traversed_line,
+            window_line,
+            rover_marker,
+            heading_arrow,
+            rank_text,
+            *condition_lines.values(),
+            J_C_image,
+            motion_image,
+            motion_title,
+            figure_title,
+            *jacobian_horizontal_lines,
+            *jacobian_vertical_lines,
+            *motion_horizontal_lines,
+            *motion_vertical_lines,
+        )
 
     figure_animation = animation.FuncAnimation(fig, update, frames=len(rendered_snapshots), interval=interval_ms, blit=False, cache_frame_data=False)
 
-    ##################################################
+        ##################################################
     # Render HTML and optional MP4
     ##################################################
 
-    with mpl.rc_context({"animation.embed_limit": float(embed_limit_mb), "animation.frame_format": html_frame_format}):
-        html = figure_animation.to_jshtml(fps=1000.0 / float(interval_ms), default_mode="loop")
-    output_path.write_text(html, encoding="utf-8")
+    frames_per_second = (
+        float(mp4_fps)
+        if mp4_fps is not None
+        else 1000.0 / float(interval_ms)
+    )
+    frames_per_second = max(frames_per_second, 1e-6)
 
-    if output_mp4 is not None:
-        if not animation.writers.is_available("ffmpeg"):
-            raise RuntimeError("Matplotlib FFmpeg writer is not available. Install ffmpeg or leave output_mp4=None.")
-        mp4_path = Path(output_mp4)
-        mp4_path.parent.mkdir(parents=True, exist_ok=True)
-        frames_per_second = float(mp4_fps) if mp4_fps is not None else 1000.0 / float(interval_ms)
-        writer = animation.FFMpegWriter(fps=max(frames_per_second, 1e-6), metadata={"artist": "calib_observability"})
-        figure_animation.save(mp4_path, writer=writer, dpi=int(mp4_dpi))
+    try:
+        ##################################################
+        # MP4 export
+        ##################################################
 
-    plt.close(fig)
+        if output_mp4 is not None:
+            if not animation.writers.is_available("ffmpeg"):
+                raise RuntimeError(
+                    "Matplotlib FFmpeg writer is not available. "
+                    "Install ffmpeg or leave output_mp4=None."
+                )
+
+            mp4_path = Path(output_mp4)
+            mp4_path.parent.mkdir(parents=True, exist_ok=True)
+
+            print(
+                f"Starting MP4 rendering: "
+                f"{len(rendered_snapshots)} frames",
+                flush=True,
+            )
+
+            writer = animation.FFMpegWriter(
+                fps=frames_per_second,
+                metadata={"artist": "calib_observability"},
+            )
+            figure_animation.save(
+                str(mp4_path),
+                writer=writer,
+                dpi=int(mp4_dpi),
+            )
+
+            print(f"Saved MP4: {mp4_path}", flush=True)
+            gc.collect()
+
+        ##################################################
+        # HTML export
+        ##################################################
+
+        if save_html:
+            if standalone_html:
+                # JSHTML stores every encoded frame in memory and then builds one
+                # enormous Python string. Refuse unsafe full-sequence rendering
+                # rather than allowing the operating system to kill the kernel.
+                if len(rendered_snapshots) > standalone_html_max_frames:
+                    raise ValueError(
+                        "Standalone JSHTML was requested for "
+                        f"{len(rendered_snapshots)} frames, but the configured "
+                        f"safe limit is {standalone_html_max_frames}. "
+                        "Set max_rendered_frames to a smaller value or use "
+                        "standalone_html=False."
+                    )
+
+                print(
+                    f"Starting standalone HTML rendering: "
+                    f"{len(rendered_snapshots)} frames",
+                    flush=True,
+                )
+
+                with mpl.rc_context(
+                    {
+                        "animation.embed_limit": float(embed_limit_mb),
+                        "animation.frame_format": html_frame_format,
+                    }
+                ):
+                    html = figure_animation.to_jshtml(
+                        fps=1000.0 / float(interval_ms),
+                        default_mode="loop",
+                    )
+
+                output_path.write_text(html, encoding="utf-8")
+
+                # Explicitly release the potentially large base64 HTML string
+                # before leaving the function.
+                del html
+                gc.collect()
+
+            else:
+                # This writes one HTML file plus a sibling directory named
+                # '<html_stem>_frames'. Frames are streamed to disk rather than
+                # accumulated as base64 strings in kernel memory.
+                print(
+                    f"Starting external-frame HTML rendering: "
+                    f"{len(rendered_snapshots)} frames",
+                    flush=True,
+                )
+
+                with mpl.rc_context(
+                    {
+                        "animation.frame_format": html_frame_format,
+                    }
+                ):
+                    html_writer = animation.HTMLWriter(
+                        fps=1000.0 / float(interval_ms),
+                        embed_frames=False,
+                        default_mode="loop",
+                    )
+
+                    figure_animation.save(
+                        str(output_path),
+                        writer=html_writer,
+                        dpi=int(html_dpi),
+                    )
+
+                frame_directory = output_path.with_name(
+                    output_path.stem + "_frames"
+                )
+
+                print(f"Saved HTML: {output_path}", flush=True)
+                print(
+                    f"Saved external frames: {frame_directory}",
+                    flush=True,
+                )
+
+    finally:
+        # Always release Matplotlib and animation references, including when
+        # FFmpeg or HTML rendering raises an exception.
+        plt.close(fig)
+        del figure_animation
+        gc.collect()
+
     return output_path
 
 
@@ -1153,9 +1365,6 @@ def save_weak_calibration_directions(
     Raises:
         ValueError: If the snapshot has no Jacobian bundle.
     '''
-
-    import matplotlib.pyplot as plt
-
     if snapshot.bundle is None:
         raise ValueError("snapshot must contain a Jacobian bundle")
     bundle = snapshot.bundle
@@ -1202,28 +1411,34 @@ def save_factor_sensitivity_figures(
         list[Path]: Saved figure paths in creation order.
     '''
 
-    import matplotlib.pyplot as plt
-
     output_directory = Path(output_dir)
     output_directory.mkdir(parents=True, exist_ok=True)
-    matrices: list[tuple[str, NDArray[np.float64]]] = [
-        ("J_C", snapshot.J_C_display),
-        ("C_X_L", snapshot.C_X_L_display),
-        ("C_X_I_gyro", snapshot.C_X_I_gyro_display),
+    matrices: list[tuple[str, NDArray[np.float64], MatrixDisplayLayout, float | None]] = [
+        (_j_c_display_title(snapshot), snapshot.J_C_display, snapshot.J_C_display_layout, 1.0 if snapshot.J_C_display_block_scales else None),
+        ("C_X_L", snapshot.C_X_L_display, snapshot.C_X_L_display_layout, None),
+        ("C_X_I_gyro", snapshot.C_X_I_gyro_display, snapshot.C_X_I_gyro_display_layout, None),
+        ("C_X_I_accel", snapshot.C_X_I_accel_display, snapshot.C_X_I_accel_display_layout, None),
     ]
     for variable_name in display_variables:
         if variable_name in snapshot.target_O_display:
-            matrices.append((_display_label(variable_name), snapshot.target_O_display[variable_name]))
+            matrices.append((_display_label(variable_name), snapshot.target_O_display[variable_name], MatrixDisplayLayout(), None))
 
     saved_paths: list[Path] = []
-    for title, matrix in matrices:
+    for title, matrix, layout, fixed_limit in matrices:
         output_path = output_directory / f"{_filename_token(title)}_heatmap.png"
         fig, ax = plt.subplots(figsize=(5.5, 3.2))
-        max_abs = max(float(np.max(np.abs(matrix))) if matrix.size else 0.0, 1e-12)
+        max_abs = fixed_limit if fixed_limit is not None else _finite_symmetric_limit(matrix)
         image = ax.imshow(matrix, aspect="auto", cmap="coolwarm", vmin=-max_abs, vmax=max_abs)
         ax.set_title(title)
         ax.set_xlabel("column")
         ax.set_ylabel("display row")
+        horizontal_lines, vertical_lines = _create_separator_lines(
+            ax,
+            len(layout.row_boundaries),
+            len(layout.column_boundaries),
+        )
+        _update_separator_lines(horizontal_lines, vertical_lines, layout)
+        _update_layout_ticks(ax, layout, x_fontsize=7, y_fontsize=7, clear_missing=False)
         fig.colorbar(image, ax=ax, shrink=0.8)
         fig.tight_layout()
         fig.savefig(output_path, dpi=160)
@@ -1549,22 +1764,352 @@ def _condition_plot_variables(display_variables: tuple[str, ...]) -> tuple[str, 
     return tuple(variable_name for variable_name in display_variables if variable_name not in {"tau_I", "tau_L"})
 
 
-def _motion_matrix_for_frame(snapshot: QuasiRealtimeSnapshot) -> tuple[NDArray[np.float64], str]:
+
+def _semantic_j_c_display(
+    matrix: ArrayLike | sparse.spmatrix | None,
+    calibration_column_slices: dict[str, slice],
+    factor_family_row_slices: dict[str, tuple[slice, ...]],
+    *,
+    max_rows: int,
+    max_cols: int,
+    normalize_factor_blocks: bool,
+) -> MatrixDisplayResult:
+    '''Build a semantic display copy of ``J_C`` without mutating the physical matrix.
+
+    Rows are split by true factor-family row metadata, downsampled independently
+    inside LiDAR, gyro, and accelerometer blocks, then concatenated in semantic
+    display order. Columns are selected from ``calibration_column_slices`` in the
+    canonical ``T_B_I | b_g | tau_I | tau_L`` order. Optional normalization is
+    applied independently to each displayed sensor-family row block only.
+    '''
+    if matrix is None:
+        return MatrixDisplayResult(np.zeros((1, 1), dtype=float))
+    if max_rows <= 0 or max_cols <= 0:
+        raise ValueError("maximum display sizes must be positive")
+
+    source_shape = matrix.shape if sparse.issparse(matrix) else np.asarray(matrix).shape
+    if len(source_shape) != 2:
+        raise ValueError("matrix must be two-dimensional")
+    if source_shape[0] == 0 or source_shape[1] == 0:
+        return MatrixDisplayResult(np.zeros((1, 1), dtype=float))
+
+    column_blocks = _semantic_column_blocks(calibration_column_slices)
+    if not column_blocks:
+        return MatrixDisplayResult(np.zeros((1, 1), dtype=float))
+    column_counts = [indices.size for _, _, indices in column_blocks]
+    displayed_column_counts = _allocate_block_display_counts(column_counts, max_cols)
+    column_indices_parts = []
+    column_lengths = []
+    column_labels = []
+    for (_variable_name, label, source_indices), display_count in zip(column_blocks, displayed_column_counts):
+        if display_count <= 0:
+            continue
+        local_indices = _display_indices(source_indices.size, display_count)
+        column_indices_parts.append(source_indices[local_indices])
+        column_lengths.append(int(display_count))
+        column_labels.append(label)
+    column_indices = np.concatenate(column_indices_parts).astype(np.int64)
+
+    row_blocks = _semantic_row_blocks(factor_family_row_slices)
+    if not row_blocks:
+        display = _matrix_take(matrix, np.arange(source_shape[0], dtype=np.int64), column_indices)
+        row_indices = _display_indices(display.shape[0], max_rows)
+        display = np.asarray(display[row_indices, :], dtype=float)
+        return MatrixDisplayResult(np.nan_to_num(display, nan=0.0, posinf=0.0, neginf=0.0), _column_only_layout(column_lengths, column_labels))
+
+    row_counts = [indices.size for _, _, indices in row_blocks]
+    displayed_row_counts = _allocate_block_display_counts(row_counts, max_rows)
+    matrix_parts = []
+    row_lengths = []
+    row_labels = []
+    block_scales: dict[str, float] = {}
+    for (family_name, label, source_indices), display_count in zip(row_blocks, displayed_row_counts):
+        if display_count <= 0:
+            continue
+        local_indices = _display_indices(source_indices.size, display_count)
+        row_indices = source_indices[local_indices]
+        block = _matrix_take(matrix, row_indices, column_indices)
+        if normalize_factor_blocks:
+            scale = _finite_nonzero_max_abs(block)
+            block_scales[family_name] = scale
+            block = block / scale
+        matrix_parts.append(block)
+        row_lengths.append(int(block.shape[0]))
+        row_labels.append(label)
+
+    display_matrix = np.vstack(matrix_parts) if matrix_parts else np.zeros((1, len(column_indices)), dtype=float)
+    layout = _matrix_layout(row_lengths, row_labels, column_lengths, column_labels)
+    if not normalize_factor_blocks:
+        display_matrix = np.nan_to_num(display_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+    return MatrixDisplayResult(np.asarray(display_matrix, dtype=float), layout, block_scales if normalize_factor_blocks else {})
+
+
+def _semantic_column_blocks(calibration_column_slices: dict[str, slice]) -> list[tuple[str, str, NDArray[np.int64]]]:
+    blocks = []
+    for variable_name in J_C_DISPLAY_COLUMN_ORDER:
+        column_slice = calibration_column_slices.get(variable_name)
+        if column_slice is None:
+            continue
+        start = 0 if column_slice.start is None else int(column_slice.start)
+        stop = start if column_slice.stop is None else int(column_slice.stop)
+        if stop > start:
+            blocks.append((variable_name, variable_name, np.arange(start, stop, dtype=np.int64)))
+    return blocks
+
+
+def _factor_family_row_slices(bundle: JacobianBundle) -> dict[str, tuple[slice, ...]]:
+    '''Return true source-row slices for LiDAR, gyro, and accelerometer factors.
+
+    The function first honors explicit bundle metadata when present. Otherwise it
+    derives families from residual block names retained in ``bundle.row_slices``;
+    the simulation assembly names measurement factors ``lidar_*``, ``imu_*``,
+    and ``accel_*`` and priors are intentionally ignored.
+    '''
+    metadata_slices = bundle.metadata.get("factor_family_row_slices") if bundle.metadata else None
+    if isinstance(metadata_slices, dict):
+        return {str(family): _coerce_row_slices(value) for family, value in metadata_slices.items()}
+
+    families: dict[str, list[slice]] = {"lidar": [], "gyro": [], "accelerometer": []}
+    for residual_name, row_slice in bundle.row_slices.items():
+        family = _family_from_residual_name(residual_name)
+        if family is not None:
+            families[family].append(row_slice)
+    return {family: tuple(slices) for family, slices in families.items() if slices}
+
+
+def _coerce_row_slices(value: object) -> tuple[slice, ...]:
+    if isinstance(value, slice):
+        return (value,)
+    coerced = []
+    for item in value if isinstance(value, (list, tuple)) else ():
+        if isinstance(item, slice):
+            coerced.append(item)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            coerced.append(slice(int(item[0]), int(item[1])))
+    return tuple(coerced)
+
+
+def _family_from_residual_name(residual_name: str) -> str | None:
+    if residual_name.startswith("lidar_"):
+        return "lidar"
+    if residual_name.startswith("imu_") or residual_name.startswith("gyro_"):
+        return "gyro"
+    if residual_name.startswith("accel_") or residual_name.startswith("accelerometer_"):
+        return "accelerometer"
+    return None
+
+
+def _semantic_row_blocks(factor_family_row_slices: dict[str, tuple[slice, ...]]) -> list[tuple[str, str, NDArray[np.int64]]]:
+    blocks = []
+    for family_name, label in J_C_FACTOR_FAMILY_ORDER:
+        row_indices = _row_indices_from_slices(factor_family_row_slices.get(family_name, ()))
+        if row_indices.size:
+            blocks.append((family_name, label, row_indices))
+    return blocks
+
+
+def _row_indices_from_slices(row_slices: tuple[slice, ...]) -> NDArray[np.int64]:
+    parts = []
+    for row_slice in row_slices:
+        start = 0 if row_slice.start is None else int(row_slice.start)
+        stop = start if row_slice.stop is None else int(row_slice.stop)
+        if stop > start:
+            parts.append(np.arange(start, stop, dtype=np.int64))
+    return np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+
+
+def _allocate_block_display_counts(source_counts: list[int], max_count: int) -> list[int]:
+    if max_count <= 0:
+        raise ValueError("maximum display size must be positive")
+    positive_indices = [index for index, count in enumerate(source_counts) if count > 0]
+    if not positive_indices:
+        return [0 for _ in source_counts]
+    if sum(source_counts) <= max_count:
+        return list(source_counts)
+    if max_count < len(positive_indices):
+        raise ValueError("max_display limit is smaller than the number of nonempty semantic blocks")
+
+    allocation = [0 for _ in source_counts]
+    for index in positive_indices:
+        allocation[index] = 1
+    remaining = max_count - len(positive_indices)
+    capacities = [max(source_counts[index] - allocation[index], 0) for index in range(len(source_counts))]
+    total_positive = float(sum(source_counts[index] for index in positive_indices))
+    raw_extras = [remaining * source_counts[index] / total_positive if index in positive_indices else 0.0 for index in range(len(source_counts))]
+    for index in positive_indices:
+        extra = min(int(np.floor(raw_extras[index])), capacities[index], remaining)
+        allocation[index] += extra
+        remaining -= extra
+    while remaining > 0:
+        candidates = [index for index in positive_indices if allocation[index] < source_counts[index]]
+        if not candidates:
+            break
+        candidates.sort(key=lambda index: (raw_extras[index] - np.floor(raw_extras[index]), source_counts[index]), reverse=True)
+        allocation[candidates[0]] += 1
+        remaining -= 1
+    return allocation
+
+
+def _matrix_take(matrix: ArrayLike | sparse.spmatrix, row_indices: NDArray[np.int64], column_indices: NDArray[np.int64]) -> NDArray[np.float64]:
+    if sparse.issparse(matrix):
+        return matrix[row_indices, :][:, column_indices].toarray().astype(float)
+    dense_matrix = np.asarray(matrix, dtype=float)
+    return dense_matrix[np.ix_(row_indices, column_indices)]
+
+
+def _matrix_layout(
+    row_lengths: list[int],
+    row_labels: list[str],
+    column_lengths: list[int],
+    column_labels: list[str],
+) -> MatrixDisplayLayout:
+    row_boundaries, row_centers = _boundaries_and_centers(row_lengths)
+    column_boundaries, column_centers = _boundaries_and_centers(column_lengths)
+    return MatrixDisplayLayout(
+        row_boundaries=row_boundaries,
+        row_centers=row_centers,
+        row_labels=tuple(row_labels),
+        column_boundaries=column_boundaries,
+        column_centers=column_centers,
+        column_labels=tuple(column_labels),
+    )
+
+
+def _column_only_layout(column_lengths: list[int], column_labels: list[str]) -> MatrixDisplayLayout:
+    column_boundaries, column_centers = _boundaries_and_centers(column_lengths)
+    return MatrixDisplayLayout(
+        column_boundaries=column_boundaries,
+        column_centers=column_centers,
+        column_labels=tuple(column_labels),
+    )
+
+
+def _boundaries_and_centers(lengths: list[int]) -> tuple[tuple[int, ...], tuple[float, ...]]:
+    boundaries = []
+    centers = []
+    start = 0
+    nonzero_lengths = [int(length) for length in lengths if int(length) > 0]
+    for index, length in enumerate(nonzero_lengths):
+        centers.append(start + 0.5 * (length - 1))
+        start += length
+        if index < len(nonzero_lengths) - 1:
+            boundaries.append(start)
+    return tuple(boundaries), tuple(centers)
+
+
+def _finite_nonzero_max_abs(matrix: NDArray[np.float64]) -> float:
+    values = np.asarray(matrix, dtype=float)
+    finite_values = values[np.isfinite(values) & (values != 0.0)]
+    if finite_values.size == 0:
+        return 1.0
+    return float(np.max(np.abs(finite_values)))
+
+
+def _c_x_display_result(
+    matrix: ArrayLike | sparse.spmatrix | None,
+    matrix_kind: str,
+    *,
+    max_rows: int,
+    max_cols: int,
+) -> MatrixDisplayResult:
+    '''Build a display matrix and semantic column layout for one C_X panel.
+
+    C_X columns describe target coordinates, so they use rotation/translation
+    layouts rather than the full calibration-vector layout used by ``J_C``.
+    '''
+    display_matrix = matrix_for_display(matrix, max_rows=max_rows, max_cols=max_cols)
+    layout = _c_x_layout(display_matrix, matrix_kind)
+    return MatrixDisplayResult(display_matrix, layout)
+
+
+def _c_x_layout(matrix: NDArray[np.float64], matrix_kind: str) -> MatrixDisplayLayout:
+    values = np.asarray(matrix)
+    column_count = int(values.shape[1]) if values.ndim == 2 else 0
+    if matrix_kind in {"lidar", "accelerometer"} and column_count == 6:
+        return _column_only_layout([3, 3], ["rotation", "translation"])
+    if matrix_kind == "gyro" and column_count == 3:
+        return _column_only_layout([3], ["rotation"])
+    return MatrixDisplayLayout()
+
+
+def _finite_symmetric_limit(matrix: NDArray[np.float64]) -> float:
+    values = np.asarray(matrix, dtype=float)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        return 1e-12
+    return max(float(np.max(np.abs(finite_values))), 1e-12)
+
+
+def _update_heatmap_limits(image: object, matrix: NDArray[np.float64], *, fixed_limit: float | None = None) -> None:
+    max_abs = float(fixed_limit) if fixed_limit is not None else _finite_symmetric_limit(matrix)
+    image.set_clim(-max_abs, max_abs)
+
+
+def _create_separator_lines(axis: object, horizontal_count: int, vertical_count: int) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    horizontal_lines = tuple(axis.axhline(0.0, color="black", linewidth=0.6, alpha=0.9, zorder=5, visible=False) for _ in range(horizontal_count))
+    vertical_lines = tuple(axis.axvline(0.0, color="black", linewidth=0.6, alpha=0.9, zorder=5, visible=False) for _ in range(vertical_count))
+    return horizontal_lines, vertical_lines
+
+
+def _update_separator_lines(
+    horizontal_lines: tuple[object, ...],
+    vertical_lines: tuple[object, ...],
+    layout: MatrixDisplayLayout,
+) -> None:
+    '''Move reusable separator artists to displayed block boundaries.'''
+    for line, boundary in zip(horizontal_lines, layout.row_boundaries):
+        y = float(boundary) - 0.5
+        line.set_ydata([y, y])
+        line.set_visible(True)
+    for line in horizontal_lines[len(layout.row_boundaries) :]:
+        line.set_visible(False)
+    for line, boundary in zip(vertical_lines, layout.column_boundaries):
+        x = float(boundary) - 0.5
+        line.set_xdata([x, x])
+        line.set_visible(True)
+    for line in vertical_lines[len(layout.column_boundaries) :]:
+        line.set_visible(False)
+
+
+def _update_layout_ticks(
+    axis: object,
+    layout: MatrixDisplayLayout,
+    *,
+    x_fontsize: int,
+    y_fontsize: int,
+    clear_missing: bool = True,
+) -> None:
+    if layout.column_labels:
+        axis.set_xticks(layout.column_centers)
+        axis.set_xticklabels(layout.column_labels, rotation=0, fontsize=x_fontsize)
+    elif clear_missing:
+        axis.set_xticks([])
+    if layout.row_labels:
+        axis.set_yticks(layout.row_centers)
+        axis.set_yticklabels(layout.row_labels, fontsize=y_fontsize)
+    else:
+        axis.set_yticks([])
+
+
+def _j_c_display_title(snapshot: QuasiRealtimeSnapshot) -> str:
+    return "J_C, factor-family normalized" if snapshot.J_C_display_block_scales else "J_C"
+
+def _motion_matrix_for_frame(snapshot: QuasiRealtimeSnapshot) -> MotionMatrixFrame:
     '''Choose the factor-sensitivity matrix shown in one frame.
 
     Args:
         snapshot (QuasiRealtimeSnapshot): Current animation snapshot.
 
     Returns:
-        tuple[NDArray[np.float64], str]: Display matrix and panel title.
+        MotionMatrixFrame: Display matrix, title, and semantic column layout.
     '''
     if snapshot.motion_accelerometer is not None:
-        return snapshot.C_X_I_accel_display, "C_X_I accel"
+        return MotionMatrixFrame(snapshot.C_X_I_accel_display, "C_X_I accel", snapshot.C_X_I_accel_display_layout)
     if snapshot.motion_lidar is not None:
-        return snapshot.C_X_L_display, "C_X_L"
+        return MotionMatrixFrame(snapshot.C_X_L_display, "C_X_L", snapshot.C_X_L_display_layout)
     if snapshot.motion_imu is not None:
-        return snapshot.C_X_I_gyro_display, "C_X_I gyro"
-    return np.zeros((1, 1), dtype=float), "C_X waiting"
+        return MotionMatrixFrame(snapshot.C_X_I_gyro_display, "C_X_I gyro", snapshot.C_X_I_gyro_display_layout)
+    return MotionMatrixFrame(np.zeros((1, 1), dtype=float), "C_X waiting", MatrixDisplayLayout())
 
 
 def _update_heatmap(image: object, axis: object, matrix: NDArray[np.float64], title: str) -> None:
@@ -1580,8 +2125,7 @@ def _update_heatmap(image: object, axis: object, matrix: NDArray[np.float64], ti
         None
     '''
     image.set_data(matrix)
-    max_abs = max(float(np.max(np.abs(matrix))) if matrix.size else 0.0, 1e-12)
-    image.set_clim(-max_abs, max_abs)
+    _update_heatmap_limits(image, matrix)
     # `imshow` keeps the extent from the matrix used during initialization.
     # Animation frames can change matrix shape, so refresh the extent together
     # with the data; otherwise the image can collapse into a tiny corner.

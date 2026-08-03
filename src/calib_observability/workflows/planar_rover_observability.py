@@ -1443,6 +1443,10 @@ def save_simple_accelerometer_dashboard(
     html_frame_format: str = "jpeg",
     embed_limit_mb: float = 1000.0,
     figsize=(17, 10),
+    downsample = 1,
+    standalone_html: bool = True,
+    standalone_html_max_frames: int = 2000,
+    save_html=True,
 ) -> tuple[ObservabilityVisualizationSeries, Path]:
     '''Run simple-accelerometer diagnostics and save the live dashboard.
 
@@ -1496,10 +1500,10 @@ def save_simple_accelerometer_dashboard(
     )
 
     animation_path = save_quasi_realtime_rover_animation(
-        dataset, simple_series.snapshots, output_html, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
+        dataset, simple_series.snapshots[::downsample], output_html, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
         show_local_accuracy_summary=True, output_mp4=output_mp4, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
-        html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize,
-    )
+        html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
+        save_html=save_html,)
     return simple_series, animation_path
 
 
