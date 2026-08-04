@@ -143,6 +143,55 @@ def _interpolate_vector(timestamps: Sequence[float], values: np.ndarray, query_t
     alpha = (query_time - timestamps[i_lower]) / (timestamps[i_upper] - timestamps[i_lower])
     return (1.0 - alpha) * values[i_lower] + alpha * values[i_upper]
 
+def _interpolate_pose(timestamps: Sequence[float], poses: Sequence[Any], query_time: float) -> np.ndarray:
+    """
+    Interpolate an SE(3) pose along the relative Lie-algebra increment.
+    """
+    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
+
+    if query_time < timestamps[0] or query_time > timestamps[-1]:
+        raise IndexError(f"Query time {query_time} lies outside pose support [{timestamps[0]}, {timestamps[-1]}]")
+
+    i_upper = int(np.searchsorted(timestamps, query_time, side="left"))
+
+    if i_upper == 0:
+        return _as_pose_matrix(poses[0])
+
+    if i_upper >= len(timestamps):
+        return _as_pose_matrix(poses[-1])
+
+    if timestamps[i_upper] == query_time:
+        return _as_pose_matrix(poses[i_upper])
+
+    i_lower = i_upper - 1
+    alpha = (query_time - timestamps[i_lower]) / (timestamps[i_upper] - timestamps[i_lower])
+
+    T_left = _as_mrob_se3(poses[i_lower])
+    T_right = _as_mrob_se3(poses[i_upper])
+    relative_xi = T_left.inv().mul(T_right).Ln()
+
+    return np.asarray(T_left.mul(mrob.SE3(alpha * relative_xi)).T(), dtype=float)
+
+def _integrate_vector_interval(timestamps: Sequence[float], values: np.ndarray, start_time: float, end_time: float) -> np.ndarray:
+    """
+    Integrate piecewise-linearly interpolated three-dimensional measurements.
+    """
+    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
+    values = np.asarray(values, dtype=float)
+
+    if values.shape != (len(timestamps), 3):
+        raise ValueError("Integrated vector measurements must have shape (N, 3)")
+
+    if start_time < timestamps[0] or end_time > timestamps[-1]:
+        raise IndexError(f"Integration interval [{start_time}, {end_time}] lies outside measurement support [{timestamps[0]}, {timestamps[-1]}]")
+
+    interior_times = timestamps[(timestamps > start_time) & (timestamps < end_time)]
+    integration_times = np.concatenate(([start_time], interior_times, [end_time]))
+    integration_values = np.vstack([_interpolate_vector(timestamps, values, time) for time in integration_times])
+    dt = np.diff(integration_times)
+
+    return np.sum(0.5 * dt[:, None] * (integration_values[:-1] + integration_values[1:]), axis=0)
+
 
 def _information_matrix(value: Any, dimension: int, factor_index: int = 0) -> np.ndarray:
     """
@@ -221,7 +270,8 @@ class FactorGraphCalibration:
         tau_I_anchor: bool = False,
         tau_L_anchor: bool = False,
         anchor_first_pose: bool = True,
-        anchor_last_pose: bool = True,
+        anchor_first_pose_each_window: bool = False,
+        anchor_last_pose: bool = False,
         anchor_all_poses: bool = False,
         accel_norm_tolerance: Optional[float] = None,
         accel_gyro_threshold: Optional[float] = None,
@@ -258,6 +308,7 @@ class FactorGraphCalibration:
             tau_I_anchor=tau_I_anchor,
             tau_L_anchor=tau_L_anchor,
             anchor_first_pose=anchor_first_pose,
+            anchor_first_pose_each_window=anchor_first_pose_each_window,
             anchor_last_pose=anchor_last_pose,
             anchor_all_poses=anchor_all_poses,
             accel_norm_tolerance=accel_norm_tolerance,
@@ -298,6 +349,7 @@ class FactorGraphCalibration:
         tau_I_anchor,
         tau_L_anchor,
         anchor_first_pose,
+        anchor_first_pose_each_window,
         anchor_last_pose,
         anchor_all_poses,
         accel_norm_tolerance,
@@ -340,6 +392,7 @@ class FactorGraphCalibration:
         self._tau_L_anchor = bool(tau_L_anchor)
 
         self._anchor_first_pose = bool(anchor_first_pose)
+        self._anchor_first_pose_each_window = bool(anchor_first_pose_each_window)
         self._anchor_last_pose = bool(anchor_last_pose)
         self._anchor_all_poses = bool(anchor_all_poses)
 
@@ -621,7 +674,7 @@ class FactorGraphCalibration:
 
         if clear_rolling_state:
             self.clear_rolling_state()
-
+            
         # print("reset: releasing old C++ graph", flush=True)
 
         old_filter_object = getattr(self, "_filter_object", None)
@@ -698,7 +751,7 @@ class FactorGraphCalibration:
             return None
 
         factor_id = self._filter_object.add_factor_1_scalar_obs(float(target), node_id, _information_matrix(information, 1))
-
+        
         self._factor_ids[family].append(factor_id)
         self._factor_counts[family] += 1
         return factor_id
@@ -715,7 +768,6 @@ class FactorGraphCalibration:
     def _validate_problem_data(
         self,
         pose_timestamps,
-        initial_poses,
         imu_timestamps,
         angular_velocity_imu,
         specific_force_imu,
@@ -730,29 +782,26 @@ class FactorGraphCalibration:
         if np.any(np.diff(pose_timestamps) <= 0):
             raise ValueError("pose_timestamps must be strictly increasing")
 
-        if len(initial_poses) != len(pose_timestamps):
-            raise ValueError("initial_poses must have the same length as pose_timestamps")
-
-        initial_poses = np.array([_as_pose_matrix(pose) for pose in initial_poses])
-
-        if self._include_gyro_factors or self._include_accel_factors:
-            if imu_timestamps is None:
-                raise ValueError("imu_timestamps are required when gyro or accelerometer factors are enabled")
-
+        if imu_timestamps is not None:
             imu_timestamps = np.asarray(imu_timestamps, dtype=float).reshape(-1)
-
             if len(imu_timestamps) < 2 or np.any(np.diff(imu_timestamps) <= 0):
                 raise ValueError("imu_timestamps must contain at least two strictly increasing values")
+        elif self._include_gyro_factors or self._include_accel_factors:
+            raise ValueError("imu_timestamps are required when gyro or accelerometer factors are enabled")
 
-        if self._include_gyro_factors:
+        if angular_velocity_imu is not None:
             angular_velocity_imu = np.asarray(angular_velocity_imu, dtype=float)
-            if angular_velocity_imu.shape != (len(imu_timestamps), 3):
+            if imu_timestamps is None or angular_velocity_imu.shape != (len(imu_timestamps), 3):
                 raise ValueError("angular_velocity_imu must have shape (len(imu_timestamps), 3)")
+        elif self._include_gyro_factors:
+            raise ValueError("angular_velocity_imu is required when gyro factors are enabled")
 
-        if self._include_accel_factors:
+        if specific_force_imu is not None:
             specific_force_imu = np.asarray(specific_force_imu, dtype=float)
-            if specific_force_imu.shape != (len(imu_timestamps), 3):
+            if imu_timestamps is None or specific_force_imu.shape != (len(imu_timestamps), 3):
                 raise ValueError("specific_force_imu must have shape (len(imu_timestamps), 3)")
+        elif self._include_accel_factors:
+            raise ValueError("specific_force_imu is required when accelerometer factors are enabled")
 
         if self._include_lidar_factors:
             if lidar_timestamps is None or lidar_odometry_poses is None:
@@ -766,13 +815,93 @@ class FactorGraphCalibration:
             if len(lidar_odometry_poses) != len(lidar_timestamps):
                 raise ValueError("lidar_odometry_poses must have the same length as lidar_timestamps")
 
-        return pose_timestamps, initial_poses, imu_timestamps, angular_velocity_imu, specific_force_imu, lidar_timestamps
+        return pose_timestamps, imu_timestamps, angular_velocity_imu, specific_force_imu, lidar_timestamps
 
-    def _pose_anchor(self, pose_index: int, number_poses: int) -> bool:
+    def _initialize_trajectory_poses(
+        self,
+        pose_timestamps: Sequence[float],
+        states: Optional[Sequence[Any]],
+        first_pose: Any,
+        imu_timestamps: Optional[Sequence[float]],
+        angular_velocity_imu: Optional[np.ndarray],
+        T_B_I_initial: Any,
+        bias_initial: Sequence[float],
+        tau_I_initial: float,
+        lidar_timestamps: Optional[Sequence[float]] = None,
+        lidar_odometry_poses: Optional[Sequence[Any]] = None,
+        T_B_L_initial: Any = None,
+        tau_L_initial: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Use supplied poses first, then initialize missing rotations from IMU and translations from LiDAR.
+        """
+        pose_timestamps = np.asarray(pose_timestamps, dtype=float).reshape(-1)
+        supplied_states = [] if states is None else list(states)
+        initial_poses = [_as_pose_matrix(state) for state in supplied_states[:len(pose_timestamps)]]
+
+        if len(initial_poses) == 0:
+            initial_poses.append(_as_pose_matrix(first_pose))
+
+        if len(initial_poses) == len(pose_timestamps):
+            return np.asarray(initial_poses)
+
+        if imu_timestamps is None or angular_velocity_imu is None:
+            raise ValueError("imu_timestamps and angular_velocity_imu are required to initialize unavailable poses")
+
+        imu_timestamps = np.asarray(imu_timestamps, dtype=float).reshape(-1)
+        angular_velocity_imu = np.asarray(angular_velocity_imu, dtype=float)
+        bias_initial = _as_vector3(bias_initial, "bias_initial")
+        T_B_I_initial = _as_pose_matrix(T_B_I_initial)
+
+        C = T_B_I_initial[:3, :3]
+        corrected_angular_velocity = angular_velocity_imu - bias_initial[None, :]
+
+        use_lidar_translation = lidar_timestamps is not None and lidar_odometry_poses is not None
+
+        if use_lidar_translation:
+            lidar_timestamps = np.asarray(lidar_timestamps, dtype=float).reshape(-1)
+            T_B_L_initial = np.eye(4) if T_B_L_initial is None else _as_pose_matrix(T_B_L_initial)
+            T_L_B_initial = np.linalg.inv(T_B_L_initial)
+
+        for pose_index in range(len(initial_poses), len(pose_timestamps)):
+            previous_pose = initial_poses[-1]
+            next_pose = previous_pose.copy()
+
+            # Initialize rotation using the existing IMU propagation.
+            imu_time_origin = float(pose_timestamps[pose_index - 1] + tau_I_initial)
+            imu_time_target = float(pose_timestamps[pose_index] + tau_I_initial)
+            phi_I = _integrate_vector_interval(imu_timestamps, corrected_angular_velocity, imu_time_origin, imu_time_target)
+            delta_rotation_body = C @ mrob.SO3(phi_I).R() @ C.T
+            next_pose[:3, :3] = previous_pose[:3, :3] @ delta_rotation_body
+
+            # Initialize only translation from the relative LiDAR odometry motion.
+            if use_lidar_translation:
+                lidar_time_origin = float(pose_timestamps[pose_index - 1] + tau_L_initial)
+                lidar_time_target = float(pose_timestamps[pose_index] + tau_L_initial)
+
+                if lidar_timestamps[0] <= lidar_time_origin and lidar_time_target <= lidar_timestamps[-1]:
+                    T_O_L_origin = _interpolate_pose(lidar_timestamps, lidar_odometry_poses, lidar_time_origin)
+                    T_O_L_target = _interpolate_pose(lidar_timestamps, lidar_odometry_poses, lidar_time_target)
+
+                    relative_lidar_pose = np.linalg.inv(T_O_L_origin) @ T_O_L_target
+                    relative_body_pose = T_B_L_initial @ relative_lidar_pose @ T_L_B_initial
+
+                    next_pose[:3, 3] = previous_pose[:3, 3] + previous_pose[:3, :3] @ relative_body_pose[:3, 3]
+
+            initial_poses.append(next_pose)
+
+        return np.asarray(initial_poses)
+
+    def _pose_anchor(self, pose_index: int, number_poses: int, is_rolling_window: bool = False) -> bool:
+        """
+        Select anchored trajectory poses for a batch graph or one rolling window.
+        """
         if self._anchor_all_poses:
             return True
 
-        if self._anchor_first_pose and pose_index == 0:
+        anchor_first_pose = self._anchor_first_pose_each_window if is_rolling_window else self._anchor_first_pose
+
+        if anchor_first_pose and pose_index == 0:
             return True
 
         if self._anchor_last_pose and pose_index == number_poses - 1:
@@ -799,7 +928,8 @@ class FactorGraphCalibration:
     def build_problem(
         self,
         pose_timestamps: Sequence[float],
-        initial_poses: Sequence[Any],
+        states: Optional[Sequence[Any]] = None,
+        first_pose: Any = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         imu_timestamps: Optional[Sequence[float]] = None,
         angular_velocity_imu: Optional[np.ndarray] = None,
         specific_force_imu: Optional[np.ndarray] = None,
@@ -813,6 +943,7 @@ class FactorGraphCalibration:
         bias_regularization_target: Sequence[float] = (0.0, 0.0, 0.0),
         tau_I_regularization_target: float = 0.0,
         tau_L_regularization_target: float = 0.0,
+        is_rolling_window: bool = False,
     ):
         """
         Build one complete batch or rolling-window calibration problem.
@@ -820,8 +951,8 @@ class FactorGraphCalibration:
         self.reset(clear_rolling_state=False)
 
         # Validate and cache the trajectory and sensor data used by this graph.
-        validated = self._validate_problem_data(pose_timestamps, initial_poses, imu_timestamps, angular_velocity_imu, specific_force_imu, lidar_timestamps, lidar_odometry_poses)
-        self._pose_timestamps, self._initial_poses, self._imu_timestamps, self._angular_velocity_imu, self._specific_force_imu, self._lidar_timestamps = validated
+        validated = self._validate_problem_data(pose_timestamps, imu_timestamps, angular_velocity_imu, specific_force_imu, lidar_timestamps, lidar_odometry_poses)
+        self._pose_timestamps, self._imu_timestamps, self._angular_velocity_imu, self._specific_force_imu, self._lidar_timestamps = validated
         self._lidar_odometry_poses = None if lidar_odometry_poses is None else list(lidar_odometry_poses)
 
         T_B_I_initial = np.eye(4) if T_B_I_initial is None else _as_pose_matrix(T_B_I_initial)
@@ -829,10 +960,13 @@ class FactorGraphCalibration:
         bias_initial = _as_vector3(bias_initial, "bias_initial")
         tau_I_initial = float(tau_I_initial)
         tau_L_initial = float(tau_L_initial)
+        self._initial_poses = self._initialize_trajectory_poses(pose_timestamps=self._pose_timestamps, states=states, first_pose=first_pose, imu_timestamps=self._imu_timestamps,
+            angular_velocity_imu=self._angular_velocity_imu, T_B_I_initial=T_B_I_initial, bias_initial=bias_initial, tau_I_initial=tau_I_initial,
+            lidar_timestamps=self._lidar_timestamps, lidar_odometry_poses=self._lidar_odometry_poses, T_B_L_initial=T_B_L_initial, tau_L_initial=tau_L_initial)
 
         # Add trajectory nodes and preserve their logical order separately from MROB node IDs.
         for pose_index, pose in enumerate(self._initial_poses):
-            node_id = self.add_pose_node(pose, anchor=self._pose_anchor(pose_index, len(self._initial_poses)))
+            node_id = self.add_pose_node(pose, anchor=self._pose_anchor(pose_index, len(self._initial_poses), is_rolling_window))
             self._nodes_pose.append(node_id)
 
         # Add only the calibration nodes required by the enabled factor families.
@@ -984,17 +1118,85 @@ class FactorGraphCalibration:
     def _time_key(self, timestamp: float) -> float:
         return round(float(timestamp), 9)
 
-    def _rolling_initial_poses(self, pose_timestamps: np.ndarray, initial_poses: Sequence[Any]) -> List[np.ndarray]:
-        rolling_initial_poses = []
+    def _rolling_state_prefix(self, pose_timestamps: Sequence[float]) -> List[np.ndarray]:
+        """
+        Return the consecutive solved-state prefix available from the previous window.
+        """
+        rolling_states = []
 
-        for timestamp, pose in zip(pose_timestamps, initial_poses):
+        for timestamp in pose_timestamps:
             key = self._time_key(timestamp)
-            if key in self._rolling_pose_cache:
-                rolling_initial_poses.append(self._rolling_pose_cache[key].copy())
-            else:
-                rolling_initial_poses.append(_as_pose_matrix(pose))
 
-        return rolling_initial_poses
+            if key not in self._rolling_pose_cache:
+                break
+
+            rolling_states.append(self._rolling_pose_cache[key].copy())
+
+        return rolling_states
+
+    def _initialize_window_poses(
+        self,
+        pose_timestamps: np.ndarray,
+        window_pose_indices: np.ndarray,
+        states: Optional[Sequence[Any]],
+        first_pose: Any,
+        imu_timestamps: Optional[Sequence[float]],
+        angular_velocity_imu: Optional[np.ndarray],
+        T_B_I_initial: Any,
+        bias_initial: Sequence[float],
+        tau_I_initial: float,
+        lidar_timestamps: Optional[Sequence[float]],
+        lidar_odometry_poses: Optional[Sequence[Any]],
+        T_B_L_initial: Any,
+        tau_L_initial: float,
+    ) -> np.ndarray:
+        """
+        Initialize a window from rolling states, supplied global states, or propagated sensor motion.
+        """
+        window_pose_timestamps = pose_timestamps[window_pose_indices]
+        rolling_states = self._rolling_state_prefix(window_pose_timestamps)
+
+        if len(rolling_states) > 0:
+            window_states = rolling_states
+        else:
+            supplied_states = [] if states is None else list(states)
+            window_states = [supplied_states[index] for index in window_pose_indices if index < len(supplied_states)]
+
+            # The first supplied state may precede the window. Propagate it to the
+            # first window timestamp before initializing the remainder of the window.
+            if len(window_states) == 0:
+                first_window_index = int(window_pose_indices[0])
+                prefix_timestamps = pose_timestamps[:first_window_index + 1]
+                prefix_poses = self._initialize_trajectory_poses(
+                    pose_timestamps=prefix_timestamps,
+                    states=supplied_states,
+                    first_pose=first_pose,
+                    imu_timestamps=imu_timestamps,
+                    angular_velocity_imu=angular_velocity_imu,
+                    T_B_I_initial=T_B_I_initial,
+                    bias_initial=bias_initial,
+                    tau_I_initial=tau_I_initial,
+                    lidar_timestamps=lidar_timestamps,
+                    lidar_odometry_poses=lidar_odometry_poses,
+                    T_B_L_initial=T_B_L_initial,
+                    tau_L_initial=tau_L_initial,
+                )
+                window_states = [prefix_poses[-1]]
+
+        return self._initialize_trajectory_poses(
+            pose_timestamps=window_pose_timestamps,
+            states=window_states,
+            first_pose=window_states[0],
+            imu_timestamps=imu_timestamps,
+            angular_velocity_imu=angular_velocity_imu,
+            T_B_I_initial=T_B_I_initial,
+            bias_initial=bias_initial,
+            tau_I_initial=tau_I_initial,
+            lidar_timestamps=lidar_timestamps,
+            lidar_odometry_poses=lidar_odometry_poses,
+            T_B_L_initial=T_B_L_initial,
+            tau_L_initial=tau_L_initial,
+        )
 
     def _rolling_calibration_initial(self, name: str, default: Any):
         if name not in self._rolling_calibration_state:
@@ -1032,7 +1234,8 @@ class FactorGraphCalibration:
         window_start: float,
         window_end: float,
         pose_timestamps: Sequence[float],
-        initial_poses: Sequence[Any],
+        states: Optional[Sequence[Any]] = None,
+        first_pose: Any = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         imu_timestamps: Optional[Sequence[float]] = None,
         angular_velocity_imu: Optional[np.ndarray] = None,
         specific_force_imu: Optional[np.ndarray] = None,
@@ -1054,20 +1257,36 @@ class FactorGraphCalibration:
         if len(window_pose_indices) == 0:
             raise ValueError(f"No trajectory poses lie inside rolling window [{window_start}, {window_end}]")
 
-        window_pose_timestamps = pose_timestamps[window_pose_indices]
-        window_input_poses = [initial_poses[index] for index in window_pose_indices]
-        window_initial_poses = self._rolling_initial_poses(window_pose_timestamps, window_input_poses)
-
         T_B_I_initial = self._rolling_calibration_initial("T_B_I", np.eye(4) if T_B_I_initial is None else T_B_I_initial)
         T_B_L_initial = self._rolling_calibration_initial("T_B_L", np.eye(4) if T_B_L_initial is None else T_B_L_initial)
         bias_initial = self._rolling_calibration_initial("bias_g", _as_vector3(bias_initial, "bias_initial"))
         tau_I_initial = self._rolling_calibration_initial("tau_I", float(tau_I_initial))
         tau_L_initial = self._rolling_calibration_initial("tau_L", float(tau_L_initial))
 
-        # Build the current window from the global sensor streams so the local factors can retain their complete temporal support margins.
+        # Initialize the window from a consecutive solved prefix when available.
+        # Otherwise propagate supplied global states up to the first window pose.
+        window_pose_timestamps = pose_timestamps[window_pose_indices]
+        window_initial_poses = self._initialize_window_poses(
+            pose_timestamps=pose_timestamps,
+            window_pose_indices=window_pose_indices,
+            states=states,
+            first_pose=first_pose,
+            imu_timestamps=imu_timestamps,
+            angular_velocity_imu=angular_velocity_imu,
+            T_B_I_initial=T_B_I_initial,
+            bias_initial=bias_initial,
+            tau_I_initial=tau_I_initial,
+            lidar_timestamps=lidar_timestamps,
+            lidar_odometry_poses=lidar_odometry_poses,
+            T_B_L_initial=T_B_L_initial,
+            tau_L_initial=tau_L_initial,
+        )
+
+        # Build the current window from global sensor streams so factors retain their complete temporal support.
         self.build_problem(
             pose_timestamps=window_pose_timestamps,
-            initial_poses=window_initial_poses,
+            states=window_initial_poses,
+            first_pose=first_pose,
             imu_timestamps=imu_timestamps,
             angular_velocity_imu=angular_velocity_imu,
             specific_force_imu=specific_force_imu,
@@ -1078,13 +1297,14 @@ class FactorGraphCalibration:
             bias_initial=bias_initial,
             tau_I_initial=tau_I_initial,
             tau_L_initial=tau_L_initial,
+            is_rolling_window=True,
         )
 
         if verbose > 0:
             print(f"WINDOW {window_index}, RAW [{window_start}, {window_end}]:")
             self.print_problem(complete=verbose > 1)
 
-        # Solve the current window and immediately cache its solution for the next shifted window.
+        # Solve the current window and cache its solution for the next shifted window.
         chi2_before = self.chi2
         self.solve_problem()
         result = self._create_window_result(window_index, window_start, window_end, chi2_before)
@@ -1104,7 +1324,8 @@ class FactorGraphCalibration:
         window_size: float,
         step_size: float,
         pose_timestamps: Sequence[float],
-        initial_poses: Sequence[Any],
+        states: Optional[Sequence[Any]] = None,
+        first_pose: Any = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
         imu_timestamps: Optional[Sequence[float]] = None,
         angular_velocity_imu: Optional[np.ndarray] = None,
         specific_force_imu: Optional[np.ndarray] = None,
@@ -1135,7 +1356,9 @@ class FactorGraphCalibration:
         if clear_previous:
             self.clear_rolling_state()
 
-        # Generate window boundaries from the trajectory timeline.
+        # Initialize the complete fallback trajectory once. Rolling solutions still override overlapping poses in every window.
+
+        # Generate window boundaries with enough initial sensor support for temporal offsets.
         trajectory_start = float(pose_timestamps[0])
         trajectory_end = float(pose_timestamps[-1])
 
@@ -1156,21 +1379,20 @@ class FactorGraphCalibration:
 
         required_start = max(safe_start_candidates)
         required_end = min(safe_end_candidates)
-        start_margin = required_start - trajectory_start
-        end_margin = required_start - trajectory_start
-        start_margin = min(start_margin, window_size / 2.0)
-        end_margin = min(end_margin, window_size / 2.0)
+
+        if required_end <= required_start:
+            raise ValueError(f"No valid rolling interval remains inside sensor support [{required_start}, {required_end}]")
 
         window_starts = []
-        current_start = trajectory_start + start_margin
+        current_start = required_start
 
-        while current_start < trajectory_end - end_margin:
+        while current_start < required_end:
             window_starts.append(current_start)
             current_start += step_size
 
         # Build, solve, warm-start, and commit the non-overlapping output segment of every window.
         for window_index, window_start in enumerate(window_starts):
-            window_end = min(window_start + window_size, trajectory_end - end_margin)
+            window_end = min(window_start + window_size, required_end)
             window_pose_indices = np.flatnonzero((pose_timestamps >= window_start) & (pose_timestamps <= window_end))
 
             if len(window_pose_indices) == 0:
@@ -1181,7 +1403,8 @@ class FactorGraphCalibration:
                 window_start=window_start,
                 window_end=window_end,
                 pose_timestamps=pose_timestamps,
-                initial_poses=initial_poses,
+                states=states,
+                first_pose=first_pose,
                 imu_timestamps=imu_timestamps,
                 angular_velocity_imu=angular_velocity_imu,
                 specific_force_imu=specific_force_imu,
@@ -1195,8 +1418,8 @@ class FactorGraphCalibration:
                 verbose=verbose,
             )
 
-            is_last_window = window_end >= trajectory_end
-            commit_end = trajectory_end if is_last_window else window_start + step_size
+            is_last_window = window_end >= required_end
+            commit_end = required_end if is_last_window else window_start + step_size
             self._commit_rolling_output(result, commit_end=commit_end, include_end=is_last_window)
 
             if is_last_window:
@@ -1204,17 +1427,18 @@ class FactorGraphCalibration:
 
         return self.rolling_results
 
-    def print_problem(self, complete: bool = False, pose_step: int = 1):
+    def print_problem(self, complete: bool = False, pose_count: int = 20):
         print(f"Chi2 error = {self.chi2}")
         print(f"Nodes = {self._filter_object.number_nodes()}, factors = {self._filter_object.number_factors()}")
         print(f"Factor counts = {self.factor_counts}")
 
         if len(self.nodes_pose) > 0:
-            for pose_index in range(0, len(self.nodes_pose), max(int(pose_step), 1)):
-                print(f"pose[{pose_index}] at t={self._pose_timestamps[pose_index]}:\n{self.trajectory_poses[pose_index]}")
+            pose_step = int(len(self.nodes_pose) / pose_count)
+            for pose_index in range(0, len(self.nodes_pose), max(pose_step, 1)):
+                print(f"pose[{pose_index}] at t={self._pose_timestamps[pose_index]}: {mrob.SE3(self.trajectory_poses[pose_index]).Ln()}")
 
         if self.T_B_I is not None:
-            print(f"T_B_I:\n{self.T_B_I}")
+            print(f"T_B_I:\n{mrob.SE3(self.T_B_I).Ln()}")
 
         if self.bias_g is not None:
             print(f"bias_g = {self.bias_g}")
@@ -1223,7 +1447,7 @@ class FactorGraphCalibration:
             print(f"tau_I = {self.tau_I}")
 
         if self.T_B_L is not None:
-            print(f"T_B_L:\n{self.T_B_L}")
+            print(f"T_B_L:\n{mrob.SE3(self.T_B_L).Ln()}")
 
         if self.tau_L is not None:
             print(f"tau_L = {self.tau_L}")
@@ -1231,14 +1455,16 @@ class FactorGraphCalibration:
         # if complete:
         #     self._filter_object.print(True)
 
-    def print_update(self):
+    def print_update(self, pose_count: int = 20):
         if self.states_init is None:
             print("No initial graph state is cached")
             return
 
         print(f"Chi2 error decreased by {self.chi2_prev - self.chi2}, from {self.chi2_prev} to {self.chi2}")
 
-        for pose_index, node_id in enumerate(self.nodes_pose):
+        pose_step = int(len(self.nodes_pose) / pose_count)
+        for pose_index in range(0, len(self.nodes_pose), max(pose_step, 1)):
+            node_id = self.nodes_pose[pose_index]
             initial_pose = np.asarray(self.states_init[node_id], dtype=float)
             current_pose = np.asarray(self.states[node_id], dtype=float)
             update = mrob.SE3(initial_pose).inv().mul(mrob.SE3(current_pose)).Ln()
