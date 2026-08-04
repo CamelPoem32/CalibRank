@@ -51,7 +51,7 @@ class PlanarRoverConfig:
     lidar_rate_hz: float = 5.0
     tau_I_true: float = 0.01
     tau_L_true: float = -0.02
-    gyro_bias_true: tuple[float, float, float] = (0.005, -0.003, 0.01)
+    gyro_bias_true: tuple[float, float, float] = (0.000, -0.000, 0.00)
     T_B_I_true: tuple[float, float, float, float, float, float] = (0.01, -0.02, 0.03, 0.12, 0.0, 0.08)
     T_B_L_true: tuple[float, float, float, float, float, float] = (0.0, 0.0, 0.04, 0.35, 0.05, 0.12)
     gyro_noise_std: float = 0.002
