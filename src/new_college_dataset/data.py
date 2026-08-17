@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Tuple
 
 import numpy as np
+from pathlib import Path
+from scipy.spatial.transform import Rotation
 
 
 @dataclass(frozen=True)
@@ -117,3 +119,84 @@ def _validate_lidar(lidar_data: LidarData) -> None:
             raise ValueError("scan_timestamps_s must have shape (N + 1,).")
         if np.any(np.diff(lidar_data.scan_timestamps_s) <= 0.0):
             raise ValueError("scan_timestamps_s must be strictly increasing.")
+
+
+
+def import_true_trajectory(file_path: Any) -> Tuple[np.ndarray, np.ndarray]:
+    '''
+    Import a timestamped ground-truth SE(3) trajectory from a CSV file.
+
+    The expected column order is:
+
+        sec, nsec, x, y, z, qx, qy, qz, qw
+
+    The returned poses are T_W_B transformations, assuming the position and
+    quaternion describe the body or sensor pose in the world frame.
+
+    Returns
+    -------
+    trajectory_timestamps
+        Array of shape (N,) containing timestamps in seconds.
+
+    trajectory_poses
+        Array of shape (N, 4, 4) containing SE(3) pose matrices.
+    '''
+
+    file_path = Path(file_path)
+
+    if not file_path.is_file():
+        raise FileNotFoundError(f"Trajectory file does not exist: {file_path}")
+
+    trajectory_data = np.genfromtxt(
+        file_path,
+        delimiter=",",
+        comments="#",
+        dtype=float,
+    )
+
+    if trajectory_data.size == 0:
+        raise ValueError(f"Trajectory file is empty: {file_path}")
+
+    if trajectory_data.ndim == 1:
+        trajectory_data = trajectory_data[None, :]
+
+    if trajectory_data.shape[1] != 9:
+        raise ValueError(
+            "Expected 9 columns: sec, nsec, x, y, z, qx, qy, qz, qw; "
+            f"received {trajectory_data.shape[1]}"
+        )
+
+    if not np.all(np.isfinite(trajectory_data)):
+        raise ValueError("Trajectory file contains non-finite values")
+
+    seconds = trajectory_data[:, 0]
+    nanoseconds = trajectory_data[:, 1]
+    positions = trajectory_data[:, 2:5]
+    quaternions = trajectory_data[:, 5:9]  # scipy convention: xyzw
+
+    trajectory_timestamps = seconds + nanoseconds * 1e-9
+
+    if np.any(np.diff(trajectory_timestamps) <= 0):
+        raise ValueError("Trajectory timestamps must be strictly increasing")
+
+    quaternion_norms = np.linalg.norm(quaternions, axis=1)
+
+    if np.any(quaternion_norms < 1e-12):
+        raise ValueError("Trajectory contains a zero-norm quaternion")
+
+    # Normalize to suppress small numerical deviations in the source file.
+    quaternions = quaternions / quaternion_norms[:, None]
+
+    rotations = Rotation.from_quat(quaternions).as_matrix()
+
+    number_poses = len(trajectory_timestamps)
+    trajectory_poses = np.repeat(
+        np.eye(4, dtype=float)[None, :, :],
+        number_poses,
+        axis=0,
+    )
+
+    trajectory_poses[:, :3, :3] = rotations
+    trajectory_poses[:, :3, 3] = positions
+
+    return trajectory_timestamps, trajectory_poses

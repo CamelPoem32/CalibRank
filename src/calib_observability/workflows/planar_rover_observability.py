@@ -54,7 +54,13 @@ from ..visualization.quasi_realtime_rover import (
     ObservabilityVisualizationSeries,
     build_observability_visualization_series,
     save_quasi_realtime_rover_animation,
+    save_quasi_realtime_rover_animation_mp4_subprocess,
 )
+
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from new_college_dataset.data import import_true_trajectory
 
 
 DatasetFactory = Callable[[PlanarRoverConfig, str], object]
@@ -589,6 +595,7 @@ def build_dataset_from_imported_sensor_streams(
     accel_covariance: NDArray[np.float64] | None = None,
     lidar_covariances: NDArray[np.float64] | None = None,
     imu_rotation_residual_std: float | None = None,
+    true_poses_path = None,
 ) -> ImportedCalibrationDataset:
     '''Build the observability dataset API from measured IMU and LiDAR streams.
 
@@ -771,19 +778,21 @@ def build_dataset_from_imported_sensor_streams(
 
     # Shift both clocks by the same reference-time origin. This preserves
     # reference_time = sensor_time + tau_initial exactly.
-    reference_time_origin = float(kept_lidar_reference_times[0])
-    shifted_lidar_reference_times = (
-        kept_lidar_reference_times - reference_time_origin
-    )
-    shifted_lidar_sensor_times = (
-        kept_lidar_sensor_times - reference_time_origin
-    )
-    shifted_imu_reference_times = (
-        imu_reference_times[imu_mask] - reference_time_origin
-    )
-    shifted_imu_sensor_times = (
-        imu_sensor_times[imu_mask] - reference_time_origin
-    )
+    # reference_time_origin = float(kept_lidar_reference_times[0])
+    # shifted_lidar_reference_times = (
+    #     kept_lidar_reference_times - reference_time_origin
+    # )
+    # shifted_lidar_sensor_times = (
+    #     kept_lidar_sensor_times - reference_time_origin
+    # )
+    # shifted_imu_reference_times = (
+    #     imu_reference_times[imu_mask] - reference_time_origin
+    # )
+    # shifted_imu_sensor_times = (
+    #     imu_sensor_times[imu_mask] - reference_time_origin
+    # )
+    imu_reference_times = imu_reference_times[imu_mask]
+    imu_sensor_times = imu_sensor_times[imu_mask]
 
     # Accumulate measured LiDAR increments into an odometry reference trajectory.
     cumulative_poses = [np.eye(4, dtype=float)]
@@ -791,10 +800,18 @@ def build_dataset_from_imported_sensor_streams(
         cumulative_poses.append(
             cumulative_poses[-1] @ relative_pose
         )
-    trajectory = DiscretePoseTrajectory(
-        shifted_lidar_reference_times,
-        np.stack(cumulative_poses, axis=0),
-    )
+    if true_poses_path is None:
+        # From lidar
+        trajectory = DiscretePoseTrajectory(
+            kept_lidar_reference_times,
+            np.stack(cumulative_poses, axis=0),
+        )
+    else:
+        true_timestamps, true_trajectory = import_true_trajectory(true_poses_path)
+        trajectory = DiscretePoseTrajectory(
+            true_timestamps,
+            true_trajectory,
+        )
 
     # Build uncertainty models for whitening only. Samples are copied unchanged.
     gyro_covariance_matrix = _as_measurement_covariance(
@@ -827,8 +844,8 @@ def build_dataset_from_imported_sensor_streams(
         raise ValueError("gravity_world must be finite")
 
     imu = ImportedImuMeasurements(
-        sensor_timestamps=shifted_imu_sensor_times,
-        reference_timestamps=shifted_imu_reference_times,
+        sensor_timestamps=imu_sensor_times,
+        reference_timestamps=imu_reference_times,
         gyroscope=gyro_samples[imu_mask].copy(),
         accelerometer=accel_samples[imu_mask].copy(),
         gyro_covariance=gyro_covariance_matrix,
@@ -836,12 +853,12 @@ def build_dataset_from_imported_sensor_streams(
         gravity_world=gravity,
     )
     lidar = ImportedLidarMeasurements(
-        sensor_timestamps=shifted_lidar_sensor_times,
-        reference_timestamps=shifted_lidar_reference_times,
+        sensor_timestamps=kept_lidar_sensor_times,
+        reference_timestamps=kept_lidar_reference_times,
         measurements=kept_relative_poses,
         covariances=kept_lidar_covariances,
-        relative_start_times=shifted_lidar_sensor_times[:-1],
-        relative_end_times=shifted_lidar_sensor_times[1:],
+        relative_start_times=lidar_sensor_times[:-1],
+        relative_end_times=lidar_sensor_times[1:],
     )
 
     gyro_bias = (
@@ -1499,11 +1516,39 @@ def save_simple_accelerometer_dashboard(
         coordinate_null_fraction_tolerance=coordinate_null_fraction_tolerance, show_local_accuracy_summary=True,
     )
 
-    animation_path = save_quasi_realtime_rover_animation(
-        dataset, simple_series.snapshots[::downsample], output_html, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
-        show_local_accuracy_summary=True, output_mp4=output_mp4, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
-        html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
-        save_html=save_html,)
+    rendered_snapshots = simple_series.snapshots[::downsample]
+    output_path = Path(output_html)
+    requested_mp4_path = Path(output_mp4) if output_mp4 is not None else None
+    save_html_effective = bool(save_html)
+
+    # Notebook 11 passes an .mp4 path as the primary animation path. Treat that
+    # as an MP4 request and avoid writing HTML bytes to an MP4-named file.
+    if output_path.suffix.lower() == ".mp4":
+        if requested_mp4_path is None:
+            requested_mp4_path = output_path
+        save_html_effective = False
+        html_output_path = output_path.with_suffix(".html")
+    else:
+        html_output_path = output_path
+
+    if save_html_effective:
+        animation_path = save_quasi_realtime_rover_animation(
+            dataset, rendered_snapshots, html_output_path, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
+            show_local_accuracy_summary=True, output_mp4=None, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
+            html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
+            save_html=True,)
+    else:
+        animation_path = requested_mp4_path if requested_mp4_path is not None else html_output_path
+
+    if requested_mp4_path is not None:
+        mp4_path = save_quasi_realtime_rover_animation_mp4_subprocess(
+            dataset, rendered_snapshots, requested_mp4_path, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
+            show_local_accuracy_summary=True, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
+            html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
+        )
+        if not save_html_effective or output_path.suffix.lower() == ".mp4":
+            animation_path = mp4_path
+
     return simple_series, animation_path
 
 

@@ -166,6 +166,64 @@ class MotionMatrixFrame:
     layout: MatrixDisplayLayout = field(default_factory=MatrixDisplayLayout)
 
 
+@dataclass(frozen=True)
+class PickleableTrajectoryProxy:
+    '''Pickle-safe trajectory proxy for subprocess dashboard rendering.
+
+    Args:
+        timestamps: Strictly increasing reference timestamps, shape ``(N,)``.
+        positions: Cartesian positions sampled from the original trajectory,
+            shape ``(N, 3)``.
+        yaws: Heading angles sampled from the original trajectory, shape ``(N,)``.
+    '''
+
+    timestamps: NDArray[np.float64]
+    positions: NDArray[np.float64]
+    yaws: NDArray[np.float64]
+
+    def sample(self, number_samples: int) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        '''Return uniformly sampled trajectory positions and yaws.
+
+        Args:
+            number_samples: Number of samples to return.
+
+        Returns:
+            Tuple of timestamps, positions, and yaws.
+        '''
+        if number_samples <= 0:
+            raise ValueError("number_samples must be positive")
+        if self.timestamps.size == 1:
+            times = np.full(int(number_samples), float(self.timestamps[0]))
+        else:
+            times = np.linspace(float(self.timestamps[0]), float(self.timestamps[-1]), int(number_samples))
+        return times, self._positions_at(times), self._yaws_at(times)
+
+    def position_at(self, query_time: float) -> NDArray[np.float64]:
+        '''Return interpolated Cartesian position at one timestamp.'''
+        return self._positions_at(np.asarray([float(query_time)], dtype=float))[0]
+
+    def yaw_at(self, query_time: float) -> float:
+        '''Return interpolated heading angle at one timestamp.'''
+        return float(self._yaws_at(np.asarray([float(query_time)], dtype=float))[0])
+
+    def _positions_at(self, query_times: NDArray[np.float64]) -> NDArray[np.float64]:
+        '''Interpolate positions component-wise.'''
+        if self.timestamps.size == 1:
+            return np.repeat(self.positions[:1], len(query_times), axis=0)
+        return np.column_stack([
+            np.interp(query_times, self.timestamps, self.positions[:, axis])
+            for axis in range(3)
+        ])
+
+    def _yaws_at(self, query_times: NDArray[np.float64]) -> NDArray[np.float64]:
+        '''Interpolate unwrapped yaws and wrap them back to [-pi, pi].'''
+        if self.timestamps.size == 1:
+            return np.repeat(self.yaws[:1], len(query_times))
+        unwrapped = np.unwrap(self.yaws)
+        interpolated = np.interp(query_times, self.timestamps, unwrapped)
+        return (interpolated + np.pi) % (2.0 * np.pi) - np.pi
+
+
 @dataclass
 class QuasiRealtimeSnapshot:
     '''Store diagnostics for one current time and active window.
@@ -2163,3 +2221,206 @@ def _filename_token(value: str) -> str:
         str: Token with spaces and path separators replaced.
     '''
     return value.replace(" ", "_").replace("/", "_").replace("{", "").replace("}", "")
+
+
+def _pickleable_snapshot_for_animation(snapshot: QuasiRealtimeSnapshot) -> QuasiRealtimeSnapshot:
+    '''Return a lightweight snapshot copy suitable for subprocess pickle.
+
+    Args:
+        snapshot: Source quasi-realtime snapshot.
+
+    Returns:
+        Snapshot with display data preserved and unused graph internals removed.
+    '''
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    accelerometer_motion = None
+    if snapshot.motion_accelerometer is not None:
+        accelerometer_motion = SimpleNamespace(
+            practical_rank=float(getattr(snapshot.motion_accelerometer, "practical_rank", np.nan))
+        )
+
+    return replace(
+        snapshot,
+        bundle=None,
+        motion_lidar=True if snapshot.motion_lidar is not None else None,
+        motion_imu=True if snapshot.motion_imu is not None else None,
+        motion_accelerometer=accelerometer_motion,
+        target_results={},
+        accelerometer_factor_terms=(),
+        accelerometer_jacobian_check_diagnostics=(),
+    )
+
+
+def _pickleable_trajectory_proxy(
+    trajectory: object,
+    *,
+    trajectory_samples: int,
+    frame_times: NDArray[np.float64],
+) -> PickleableTrajectoryProxy:
+    '''Build a pickle-safe trajectory proxy for a renderer subprocess.
+
+    Args:
+        trajectory: Original trajectory object exposing ``sample``,
+            ``position_at``, and ``yaw_at``.
+        trajectory_samples: Number of samples requested by the dashboard.
+        frame_times: Snapshot timestamps that must be represented exactly in
+            the proxy support.
+
+    Returns:
+        PickleableTrajectoryProxy backed by plain NumPy arrays.
+    '''
+    sample_times, _, _ = trajectory.sample(int(trajectory_samples))
+    support_times = np.unique(
+        np.concatenate((np.asarray(sample_times, dtype=float).reshape(-1), np.asarray(frame_times, dtype=float).reshape(-1)))
+    )
+    support_times = support_times[np.isfinite(support_times)]
+    if support_times.size == 0:
+        raise ValueError("trajectory proxy requires at least one finite timestamp")
+
+    positions = np.vstack([
+        np.asarray(trajectory.position_at(float(timestamp)), dtype=float).reshape(3)
+        for timestamp in support_times
+    ])
+    yaws = np.asarray([float(trajectory.yaw_at(float(timestamp))) for timestamp in support_times], dtype=float)
+    return PickleableTrajectoryProxy(
+        timestamps=support_times,
+        positions=positions,
+        yaws=yaws,
+    )
+
+
+def save_quasi_realtime_rover_animation_mp4_subprocess(
+    dataset: object,
+    snapshots: list[QuasiRealtimeSnapshot],
+    output_mp4: str | Path,
+    *,
+    display_variables: tuple[str, ...] = ("T_B_I", "b_g", "tau_I", "tau_L"),
+    trajectory_samples: int = 600,
+    interval_ms: int = 250,
+    figsize=(17, 10),
+    show_local_accuracy_summary: bool = True,
+    mp4_fps: float | None = None,
+    mp4_dpi: int = 160,
+    max_rendered_frames: int | None = None,
+    html_dpi: int = 80,
+    html_frame_format: str = "jpeg",
+    embed_limit_mb: float = 1000.0,
+    standalone_html: bool = False,
+    standalone_html_max_frames: int = 300,
+    keep_payload: bool = False,
+) -> Path:
+    """Render a quasi-realtime dashboard MP4 in a child Python process.
+
+    Args:
+        dataset: Dataset containing the trajectory and sensor metadata used by
+            save_quasi_realtime_rover_animation.
+        snapshots: Ordered visualization snapshots to render.
+        output_mp4: Destination MP4 path.
+        display_variables: Calibration variables shown in dashboard text and
+            condition plots.
+        trajectory_samples: Number of trajectory samples for the path display.
+        interval_ms: Animation playback delay in milliseconds.
+        figsize: Matplotlib figure size in inches.
+        show_local_accuracy_summary: Whether rank text includes local accuracy.
+        mp4_fps: Optional MP4 frame rate. Defaults to 1000 / interval_ms.
+        mp4_dpi: MP4 rendering resolution.
+        max_rendered_frames: Optional uniformly sampled frame limit.
+        html_dpi: Figure DPI used by the child renderer while constructing the
+            shared animation artists.
+        html_frame_format: Retained for API symmetry with HTML rendering.
+        embed_limit_mb: Retained for API symmetry with HTML rendering.
+        standalone_html: Retained for API symmetry with HTML rendering.
+        standalone_html_max_frames: Retained for API symmetry with HTML rendering.
+        keep_payload: If true, keep the temporary pickle payload beside the MP4.
+
+    Returns:
+        Resolved MP4 path.
+    """
+    import pickle
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    if not snapshots:
+        raise ValueError("snapshots must be nonempty")
+
+    mp4_path = Path(output_mp4).expanduser().resolve()
+    mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path = mp4_path.with_suffix(mp4_path.suffix + ".payload.pkl")
+    script_path = Path(__file__).resolve().parents[3] / "src" / "calib_observability" / "visualization" / "render_quasi_realtime_dashboard.py"
+    if not script_path.exists():
+        raise FileNotFoundError(f"MP4 subprocess renderer is missing: {script_path}")
+
+    pickleable_snapshots = [_pickleable_snapshot_for_animation(snapshot) for snapshot in snapshots]
+    frame_times = np.asarray([snapshot.current_time for snapshot in pickleable_snapshots], dtype=float)
+    trajectory_proxy = _pickleable_trajectory_proxy(
+        getattr(dataset, "trajectory"),
+        trajectory_samples=trajectory_samples,
+        frame_times=frame_times,
+    )
+
+    payload = {
+        "dataset": SimpleNamespace(trajectory=trajectory_proxy),
+        "snapshots": pickleable_snapshots,
+        "render_kwargs": {
+            "display_variables": display_variables,
+            "trajectory_samples": trajectory_samples,
+            "interval_ms": interval_ms,
+            "figsize": figsize,
+            "show_local_accuracy_summary": show_local_accuracy_summary,
+            "mp4_fps": mp4_fps,
+            "mp4_dpi": mp4_dpi,
+            "max_rendered_frames": max_rendered_frames,
+            "html_dpi": html_dpi,
+            "html_frame_format": html_frame_format,
+            "embed_limit_mb": embed_limit_mb,
+            "standalone_html": standalone_html,
+            "standalone_html_max_frames": standalone_html_max_frames,
+        },
+    }
+
+    with payload_path.open("wb") as handle:
+        pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    command = [
+        sys.executable,
+        str(script_path),
+        "--payload",
+        str(payload_path),
+        "--output-mp4",
+        str(mp4_path),
+    ]
+    succeeded = False
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        succeeded = True
+        if completed.stdout:
+            print(completed.stdout.strip(), flush=True)
+        if completed.stderr:
+            print(completed.stderr.strip(), flush=True)
+    except subprocess.CalledProcessError as exc:
+        message = [
+            "Quasi-realtime dashboard MP4 subprocess failed.",
+            f"Command: {' '.join(map(str, exc.cmd))}",
+            f"Return code: {exc.returncode}",
+        ]
+        if exc.stdout:
+            message.extend(["", "Child stdout:", exc.stdout.strip()])
+        if exc.stderr:
+            message.extend(["", "Child stderr:", exc.stderr.strip()])
+        if not keep_payload:
+            message.extend(["", f"Debug payload retained at: {payload_path}"])
+        raise RuntimeError("\n".join(message)) from exc
+    finally:
+        if succeeded and not keep_payload:
+            payload_path.unlink(missing_ok=True)
+
+    return mp4_path
+
