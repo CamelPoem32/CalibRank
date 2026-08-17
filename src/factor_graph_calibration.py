@@ -8,216 +8,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import mrob
 import numpy as np
 
+import data_processing
+from numerical_calibration import NumericalCalibrationConfig, estimate_imu_calibration_numerical
 
-def subsample_indices(indices: Iterable[int], final_length: Optional[int]) -> np.ndarray:
-    """
-    Select almost equally spaced values from a sequence of integer indices.
-
-    The first and last input indices are always preserved. If final_length is
-    None or is not smaller than the input length, all indices are returned.
-    """
-    indices = np.asarray(list(indices), dtype=np.int64).reshape(-1)
-
-    if len(indices) == 0:
-        return indices.copy()
-
-    if final_length is None or final_length >= len(indices):
-        return indices.copy()
-
-    if final_length < 2:
-        raise ValueError("final_length must be at least 2 when subsampling measurement support")
-
-    positions = np.rint(np.linspace(0, len(indices) - 1, int(final_length))).astype(np.int64)
-    positions[0] = 0
-    positions[-1] = len(indices) - 1
-
-    if len(np.unique(positions)) != len(positions):
-        raise RuntimeError("Failed to generate unique equally spaced subsampling positions")
-
-    return indices[positions]
-
-
-def select_time_support_indices(timestamps: Sequence[float], support_start: float, support_end: float, final_length: Optional[int]) -> np.ndarray:
-    """
-    Return subsampled indices whose first and last timestamps bracket a time interval.
-
-    One sample before support_start and one sample after support_end are included
-    whenever they exist. This is important because the C++ factors interpolate
-    measurements at shifted query times.
-    """
-    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
-
-    if len(timestamps) < 2:
-        raise ValueError("At least two timestamped measurements are required")
-
-    if not np.all(np.isfinite(timestamps)):
-        raise ValueError("Measurement timestamps must be finite")
-
-    if np.any(np.diff(timestamps) <= 0):
-        raise ValueError("Measurement timestamps must be strictly increasing")
-
-    if support_end <= support_start:
-        raise ValueError("support_end must be greater than support_start")
-
-    if support_start < timestamps[0] or support_end > timestamps[-1]:
-        raise IndexError(f"Requested support [{support_start}, {support_end}] lies outside measurement timestamps [{timestamps[0]}, {timestamps[-1]}]")
-
-    i_start = max(int(np.searchsorted(timestamps, support_start, side="right")) - 1, 0)
-    i_end = min(int(np.searchsorted(timestamps, support_end, side="left")) + 1, len(timestamps))
-
-    indices = np.arange(i_start, i_end, dtype=np.int64)
-
-    if len(indices) < 2:
-        raise ValueError("Selected measurement support contains fewer than two samples")
-
-    return subsample_indices(indices, final_length)
-
-
-def _as_vector3(values: Sequence[float], name: str) -> np.ndarray:
-    values = np.asarray(values, dtype=float).reshape(-1)
-
-    if values.shape != (3,):
-        raise ValueError(f"{name} must contain exactly three values")
-
-    if not np.all(np.isfinite(values)):
-        raise ValueError(f"{name} must be finite")
-
-    return values.copy()
-
-
-def _as_pose_matrix(pose: Any) -> np.ndarray:
-    if isinstance(pose, mrob.SE3):
-        return np.asarray(pose.T(), dtype=float).copy()
-
-    pose = np.asarray(pose, dtype=float)
-
-    if pose.shape == (6,):
-        return np.asarray(mrob.SE3(pose).T(), dtype=float)
-
-    if pose.shape != (4, 4):
-        raise ValueError("A pose must be an mrob.SE3 object, a six-dimensional tangent vector, or a 4x4 transformation matrix")
-
-    if not np.all(np.isfinite(pose)):
-        raise ValueError("Pose matrix must be finite")
-
-    if not mrob.isSE3(pose):
-        raise ValueError("Pose matrix must be a valid SE(3) transformation")
-
-    return pose.copy()
-
-
-def _as_mrob_se3(pose: Any) -> mrob.SE3:
-    if isinstance(pose, mrob.SE3):
-        return mrob.SE3(pose)
-
-    pose = np.asarray(pose, dtype=float)
-
-    if pose.shape == (6,):
-        return mrob.SE3(pose)
-
-    return mrob.SE3(_as_pose_matrix(pose))
-
-
-def _interpolate_vector(timestamps: Sequence[float], values: np.ndarray, query_time: float) -> np.ndarray:
-    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
-    values = np.asarray(values, dtype=float)
-
-    if values.shape != (len(timestamps), 3):
-        raise ValueError("Interpolated vector measurements must have shape (N, 3)")
-
-    if query_time < timestamps[0] or query_time > timestamps[-1]:
-        raise IndexError(f"Query time {query_time} lies outside measurement support [{timestamps[0]}, {timestamps[-1]}]")
-
-    i_upper = int(np.searchsorted(timestamps, query_time, side="left"))
-
-    if i_upper == 0:
-        return values[0].copy()
-
-    if i_upper >= len(timestamps):
-        return values[-1].copy()
-
-    if timestamps[i_upper] == query_time:
-        return values[i_upper].copy()
-
-    i_lower = i_upper - 1
-    alpha = (query_time - timestamps[i_lower]) / (timestamps[i_upper] - timestamps[i_lower])
-    return (1.0 - alpha) * values[i_lower] + alpha * values[i_upper]
-
-def _interpolate_pose(timestamps: Sequence[float], poses: Sequence[Any], query_time: float) -> np.ndarray:
-    """
-    Interpolate an SE(3) pose along the relative Lie-algebra increment.
-    """
-    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
-
-    if query_time < timestamps[0] or query_time > timestamps[-1]:
-        raise IndexError(f"Query time {query_time} lies outside pose support [{timestamps[0]}, {timestamps[-1]}]")
-
-    i_upper = int(np.searchsorted(timestamps, query_time, side="left"))
-
-    if i_upper == 0:
-        return _as_pose_matrix(poses[0])
-
-    if i_upper >= len(timestamps):
-        return _as_pose_matrix(poses[-1])
-
-    if timestamps[i_upper] == query_time:
-        return _as_pose_matrix(poses[i_upper])
-
-    i_lower = i_upper - 1
-    alpha = (query_time - timestamps[i_lower]) / (timestamps[i_upper] - timestamps[i_lower])
-
-    T_left = _as_mrob_se3(poses[i_lower])
-    T_right = _as_mrob_se3(poses[i_upper])
-    relative_xi = T_left.inv().mul(T_right).Ln()
-
-    return np.asarray(T_left.mul(mrob.SE3(alpha * relative_xi)).T(), dtype=float)
-
-def _integrate_vector_interval(timestamps: Sequence[float], values: np.ndarray, start_time: float, end_time: float) -> np.ndarray:
-    """
-    Integrate piecewise-linearly interpolated three-dimensional measurements.
-    """
-    timestamps = np.asarray(timestamps, dtype=float).reshape(-1)
-    values = np.asarray(values, dtype=float)
-
-    if values.shape != (len(timestamps), 3):
-        raise ValueError("Integrated vector measurements must have shape (N, 3)")
-
-    if start_time < timestamps[0] or end_time > timestamps[-1]:
-        raise IndexError(f"Integration interval [{start_time}, {end_time}] lies outside measurement support [{timestamps[0]}, {timestamps[-1]}]")
-
-    interior_times = timestamps[(timestamps > start_time) & (timestamps < end_time)]
-    integration_times = np.concatenate(([start_time], interior_times, [end_time]))
-    integration_values = np.vstack([_interpolate_vector(timestamps, values, time) for time in integration_times])
-    dt = np.diff(integration_times)
-
-    return np.sum(0.5 * dt[:, None] * (integration_values[:-1] + integration_values[1:]), axis=0)
-
-
-def _information_matrix(value: Any, dimension: int, factor_index: int = 0) -> np.ndarray:
-    """
-    Convert a scalar, one matrix, or a sequence of matrices to one information matrix.
-    """
-    if value is None:
-        return np.eye(dimension)
-
-    value = np.asarray(value, dtype=float)
-
-    if value.ndim == 0:
-        matrix = np.eye(dimension) * float(value)
-    elif value.shape == (dimension, dimension):
-        matrix = value
-    elif value.ndim == 3 and value.shape[1:] == (dimension, dimension):
-        matrix = value[min(factor_index, len(value) - 1)]
-    else:
-        raise ValueError(f"Information must be a scalar, a ({dimension}, {dimension}) matrix, or an (N, {dimension}, {dimension}) array")
-
-    if not np.all(np.isfinite(matrix)):
-        raise ValueError("Information matrix must be finite")
-
-    if not np.allclose(matrix, matrix.T, atol=1e-10):
-        raise ValueError("Information matrix must be symmetric")
-
-    return matrix.copy()
 
 
 @dataclass
@@ -235,6 +28,18 @@ class CalibrationWindowResult:
     chi2_before: float
     chi2_after: float
     factor_counts: Dict[str, int] = field(default_factory=dict)
+    numerical_T_B_I_initial: Optional[np.ndarray] = None
+    numerical_tau_I_initial: Optional[float] = None
+    numerical_T_B_I_prior: Optional[np.ndarray] = None
+    numerical_tau_I_prior: Optional[float] = None
+    numerical_calibration_used_as_initial: bool = False
+    numerical_calibration_used_as_prior: bool = False
+    numerical_rotation_rssd: Optional[float] = None
+    numerical_residual_rmse: Optional[float] = None
+    numerical_excitation_singular_values: Optional[np.ndarray] = None
+    numerical_calibration_success: Optional[bool] = None
+    numerical_calibration_message: Optional[str] = None
+    numerical_calibration_result: Optional[Any] = None
 
 
 class FactorGraphCalibration:
@@ -242,8 +47,12 @@ class FactorGraphCalibration:
     Python wrapper around the MROB LiDAR-IMU calibration factors.
 
     A new MROB graph is built for every batch or rolling window. Rolling-window
-    continuity is preserved by using solved poses and calibration variables from
-    the preceding window as initial states in the next overlapping window.
+    continuity is preserved by carrying solved poses and calibration variables
+    into the next overlapping window.
+
+    Numerical calibration can independently provide the graph initialization and
+    the soft-prior target. By default it initializes ``T_B_I`` and ``tau_I``,
+    while regularization remains centered on the previous rolling solution.
     """
 
     def __init__(
@@ -264,6 +73,7 @@ class FactorGraphCalibration:
         include_gyro_factors: bool = True,
         include_accel_factors: bool = True,
         include_lidar_factors: bool = True,
+        acc_mode: str = "simple",
         T_B_I_anchor: bool = False,
         T_B_L_anchor: bool = False,
         bias_anchor: bool = False,
@@ -284,6 +94,9 @@ class FactorGraphCalibration:
         solutionTolerance: float = 1e-6,
         solver_verbose: bool = False,
         scheduler: Optional[Sequence[Tuple[float, int]]] = None,
+        use_numerical_calibration_prior: bool = False,
+        numerical_calibration_config: Optional[NumericalCalibrationConfig] = None,
+        use_numerical_calibration_initial: bool = True,
     ):
         self._init_filter_parameters(
             imu_samples_per_factor=imu_samples_per_factor,
@@ -302,6 +115,7 @@ class FactorGraphCalibration:
             include_gyro_factors=include_gyro_factors,
             include_accel_factors=include_accel_factors,
             include_lidar_factors=include_lidar_factors,
+            acc_mode=acc_mode,
             T_B_I_anchor=T_B_I_anchor,
             T_B_L_anchor=T_B_L_anchor,
             bias_anchor=bias_anchor,
@@ -322,6 +136,9 @@ class FactorGraphCalibration:
             solutionTolerance=solutionTolerance,
             solver_verbose=solver_verbose,
             scheduler=scheduler,
+            use_numerical_calibration_prior=use_numerical_calibration_prior,
+            numerical_calibration_config=numerical_calibration_config,
+            use_numerical_calibration_initial=use_numerical_calibration_initial,
         )
         self.reset(clear_rolling_state=True)
 
@@ -343,6 +160,7 @@ class FactorGraphCalibration:
         include_gyro_factors,
         include_accel_factors,
         include_lidar_factors,
+        acc_mode,
         T_B_I_anchor,
         T_B_L_anchor,
         bias_anchor,
@@ -363,6 +181,9 @@ class FactorGraphCalibration:
         solutionTolerance,
         solver_verbose,
         scheduler,
+        use_numerical_calibration_prior,
+        numerical_calibration_config,
+        use_numerical_calibration_initial,
     ):
         """Initialize factor selection, graph structure, regularization, and solver parameters."""
         self._imu_samples_per_factor = imu_samples_per_factor
@@ -370,7 +191,7 @@ class FactorGraphCalibration:
         self._imu_time_offset_margin = float(imu_time_offset_margin)
         self._lidar_time_offset_margin = float(lidar_time_offset_margin)
 
-        self._gravity_world = _as_vector3(gravity_world, "gravity_world")
+        self._gravity_world = data_processing._as_vector3(gravity_world, "gravity_world")
         self._gyro_information = copy.deepcopy(gyro_information)
         self._accel_information = copy.deepcopy(accel_information)
         self._lidar_information = copy.deepcopy(lidar_information)
@@ -384,6 +205,11 @@ class FactorGraphCalibration:
         self._include_gyro_factors = bool(include_gyro_factors)
         self._include_accel_factors = bool(include_accel_factors)
         self._include_lidar_factors = bool(include_lidar_factors)
+
+        acc_mode = str(acc_mode).lower()
+        if acc_mode not in {"simple", "complex"}:
+            raise ValueError("acc_mode must be either 'simple' or 'complex'")
+        self._acc_mode = acc_mode
 
         self._T_B_I_anchor = bool(T_B_I_anchor)
         self._T_B_L_anchor = bool(T_B_L_anchor)
@@ -409,6 +235,9 @@ class FactorGraphCalibration:
         self._solutionTolerance = float(solutionTolerance)
         self._solver_verbose = bool(solver_verbose)
         self._scheduler = None if scheduler is None else [(float(value), int(iterations)) for value, iterations in scheduler]
+        self._use_numerical_calibration_prior = bool(use_numerical_calibration_prior)
+        self._use_numerical_calibration_initial = bool(use_numerical_calibration_initial)
+        self._numerical_calibration_config = NumericalCalibrationConfig() if numerical_calibration_config is None else copy.deepcopy(numerical_calibration_config)
 
         if self._imu_samples_per_factor is not None and self._imu_samples_per_factor < 2:
             raise ValueError("imu_samples_per_factor must be at least 2 or None")
@@ -516,6 +345,10 @@ class FactorGraphCalibration:
     @property
     def factor_metadata(self):
         return copy.deepcopy(self._factor_metadata)
+
+    @property
+    def acc_mode(self):
+        return self._acc_mode
 
     @property
     def rolling_results(self):
@@ -671,6 +504,7 @@ class FactorGraphCalibration:
         self._chi2 = 0.0
         self._chi2_prev = 0.0
         self._last_window_result = None
+        self._current_numerical_calibration_result = None
 
         if clear_rolling_state:
             self.clear_rolling_state()
@@ -702,13 +536,13 @@ class FactorGraphCalibration:
         return mrob.NODE_ANCHOR if anchor else mrob.NODE_STANDARD
 
     def add_pose_node(self, pose: Any, anchor: bool = False) -> int:
-        node_id = self._filter_object.add_node_pose_3d(_as_mrob_se3(pose), mode=self._node_mode(anchor))
+        node_id = self._filter_object.add_node_pose_3d(data_processing._as_mrob_se3(pose), mode=self._node_mode(anchor))
         self._nodes.append(node_id)
         self._invalidate_state_cache()
         return node_id
 
     def add_vector_node(self, values: Sequence[float], anchor: bool = False) -> int:
-        node_id = self._filter_object.add_node_landmark_3d(_as_vector3(values, "values"), mode=self._node_mode(anchor))
+        node_id = self._filter_object.add_node_landmark_3d(data_processing._as_vector3(values, "values"), mode=self._node_mode(anchor))
         self._nodes.append(node_id)
         self._invalidate_state_cache()
         return node_id
@@ -731,6 +565,12 @@ class FactorGraphCalibration:
         self._factor_counts["accel"] += 1
         return factor_id
 
+    def add_accel_lever_arm_calibration_factor(self, pose_time_previous: float, pose_time: float, pose_time_next: float, timestamps: np.ndarray, specific_force_imu: np.ndarray, angular_velocity_imu: np.ndarray, node_pose_previous: int, node_pose: int, node_pose_next: int, information: np.ndarray,) -> int:
+        factor_id = self._filter_object.add_factor_accel_lever_arm_calib(pose_time_previous, pose_time, pose_time_next, timestamps, specific_force_imu, angular_velocity_imu, self._gravity_world, node_pose_previous, node_pose, node_pose_next, self.node_T_B_I, self.node_bias_g, self.node_tau_I, information,)
+        self._factor_ids["accel"].append(factor_id)
+        self._factor_counts["accel"] += 1
+        return factor_id
+
     def add_lidar_calibration_factor(self, pose_time_origin: float, pose_time_target: float, timestamps: np.ndarray, lidar_odometry_poses: Sequence[Any], node_origin: int, node_target: int, information: np.ndarray) -> int:
         factor_id = self._filter_object.add_factor_lidar_calib_odometry(pose_time_origin, pose_time_target, timestamps, lidar_odometry_poses, node_origin, node_target, self.node_T_B_L, self.node_tau_L, information)
         self._factor_ids["lidar"].append(factor_id)
@@ -741,7 +581,7 @@ class FactorGraphCalibration:
         if self.node_bias_g is None or information is None or self.bias_anchor:
             return None
 
-        factor_id = self._filter_object.add_factor_1_landmark_3d(_as_vector3(target, "bias regularization target"), self.node_bias_g, _information_matrix(information, 3))
+        factor_id = self._filter_object.add_factor_1_landmark_3d(data_processing._as_vector3(target, "bias regularization target"), self.node_bias_g, data_processing._information_matrix(information, 3))
         self._factor_ids["bias_prior"].append(factor_id)
         self._factor_counts["bias_prior"] += 1
         return factor_id
@@ -750,7 +590,7 @@ class FactorGraphCalibration:
         if node_id is None or information is None:
             return None
 
-        factor_id = self._filter_object.add_factor_1_scalar_obs(float(target), node_id, _information_matrix(information, 1))
+        factor_id = self._filter_object.add_factor_1_scalar_obs(float(target), node_id, data_processing._information_matrix(information, 1))
         
         self._factor_ids[family].append(factor_id)
         self._factor_counts[family] += 1
@@ -760,7 +600,7 @@ class FactorGraphCalibration:
         if node_id is None or information is None:
             return None
 
-        factor_id = self._filter_object.add_factor_1pose_3d(_as_mrob_se3(target), node_id, _information_matrix(information, 6))
+        factor_id = self._filter_object.add_factor_1pose_3d(data_processing._as_mrob_se3(target), node_id, data_processing._information_matrix(information, 6))
         self._factor_ids[family].append(factor_id)
         self._factor_counts[family] += 1
         return factor_id
@@ -782,6 +622,11 @@ class FactorGraphCalibration:
         if np.any(np.diff(pose_timestamps) <= 0):
             raise ValueError("pose_timestamps must be strictly increasing")
 
+        requires_angular_velocity = (
+            self._include_gyro_factors
+            or (self._include_accel_factors and self._acc_mode == "complex")
+        )
+
         if imu_timestamps is not None:
             imu_timestamps = np.asarray(imu_timestamps, dtype=float).reshape(-1)
             if len(imu_timestamps) < 2 or np.any(np.diff(imu_timestamps) <= 0):
@@ -793,8 +638,8 @@ class FactorGraphCalibration:
             angular_velocity_imu = np.asarray(angular_velocity_imu, dtype=float)
             if imu_timestamps is None or angular_velocity_imu.shape != (len(imu_timestamps), 3):
                 raise ValueError("angular_velocity_imu must have shape (len(imu_timestamps), 3)")
-        elif self._include_gyro_factors:
-            raise ValueError("angular_velocity_imu is required when gyro factors are enabled")
+        elif requires_angular_velocity:
+            raise ValueError("angular_velocity_imu is required when gyro factors or complex accelerometer factors are enabled")
 
         if specific_force_imu is not None:
             specific_force_imu = np.asarray(specific_force_imu, dtype=float)
@@ -817,81 +662,6 @@ class FactorGraphCalibration:
 
         return pose_timestamps, imu_timestamps, angular_velocity_imu, specific_force_imu, lidar_timestamps
 
-    def _initialize_trajectory_poses(
-        self,
-        pose_timestamps: Sequence[float],
-        states: Optional[Sequence[Any]],
-        first_pose: Any,
-        imu_timestamps: Optional[Sequence[float]],
-        angular_velocity_imu: Optional[np.ndarray],
-        T_B_I_initial: Any,
-        bias_initial: Sequence[float],
-        tau_I_initial: float,
-        lidar_timestamps: Optional[Sequence[float]] = None,
-        lidar_odometry_poses: Optional[Sequence[Any]] = None,
-        T_B_L_initial: Any = None,
-        tau_L_initial: float = 0.0,
-    ) -> np.ndarray:
-        """
-        Use supplied poses first, then initialize missing rotations from IMU and translations from LiDAR.
-        """
-        pose_timestamps = np.asarray(pose_timestamps, dtype=float).reshape(-1)
-        supplied_states = [] if states is None else list(states)
-        initial_poses = [_as_pose_matrix(state) for state in supplied_states[:len(pose_timestamps)]]
-
-        if len(initial_poses) == 0:
-            initial_poses.append(_as_pose_matrix(first_pose))
-
-        if len(initial_poses) == len(pose_timestamps):
-            return np.asarray(initial_poses)
-
-        if imu_timestamps is None or angular_velocity_imu is None:
-            raise ValueError("imu_timestamps and angular_velocity_imu are required to initialize unavailable poses")
-
-        imu_timestamps = np.asarray(imu_timestamps, dtype=float).reshape(-1)
-        angular_velocity_imu = np.asarray(angular_velocity_imu, dtype=float)
-        bias_initial = _as_vector3(bias_initial, "bias_initial")
-        T_B_I_initial = _as_pose_matrix(T_B_I_initial)
-
-        C = T_B_I_initial[:3, :3]
-        corrected_angular_velocity = angular_velocity_imu - bias_initial[None, :]
-
-        use_lidar_translation = lidar_timestamps is not None and lidar_odometry_poses is not None
-
-        if use_lidar_translation:
-            lidar_timestamps = np.asarray(lidar_timestamps, dtype=float).reshape(-1)
-            T_B_L_initial = np.eye(4) if T_B_L_initial is None else _as_pose_matrix(T_B_L_initial)
-            T_L_B_initial = np.linalg.inv(T_B_L_initial)
-
-        for pose_index in range(len(initial_poses), len(pose_timestamps)):
-            previous_pose = initial_poses[-1]
-            next_pose = previous_pose.copy()
-
-            # Initialize rotation using the existing IMU propagation.
-            imu_time_origin = float(pose_timestamps[pose_index - 1] + tau_I_initial)
-            imu_time_target = float(pose_timestamps[pose_index] + tau_I_initial)
-            phi_I = _integrate_vector_interval(imu_timestamps, corrected_angular_velocity, imu_time_origin, imu_time_target)
-            delta_rotation_body = C @ mrob.SO3(phi_I).R() @ C.T
-            next_pose[:3, :3] = previous_pose[:3, :3] @ delta_rotation_body
-
-            # Initialize only translation from the relative LiDAR odometry motion.
-            if use_lidar_translation:
-                lidar_time_origin = float(pose_timestamps[pose_index - 1] + tau_L_initial)
-                lidar_time_target = float(pose_timestamps[pose_index] + tau_L_initial)
-
-                if lidar_timestamps[0] <= lidar_time_origin and lidar_time_target <= lidar_timestamps[-1]:
-                    T_O_L_origin = _interpolate_pose(lidar_timestamps, lidar_odometry_poses, lidar_time_origin)
-                    T_O_L_target = _interpolate_pose(lidar_timestamps, lidar_odometry_poses, lidar_time_target)
-
-                    relative_lidar_pose = np.linalg.inv(T_O_L_origin) @ T_O_L_target
-                    relative_body_pose = T_B_L_initial @ relative_lidar_pose @ T_L_B_initial
-
-                    next_pose[:3, 3] = previous_pose[:3, 3] + previous_pose[:3, :3] @ relative_body_pose[:3, 3]
-
-            initial_poses.append(next_pose)
-
-        return np.asarray(initial_poses)
-
     def _pose_anchor(self, pose_index: int, number_poses: int, is_rolling_window: bool = False) -> bool:
         """
         Select anchored trajectory poses for a batch graph or one rolling window.
@@ -911,7 +681,7 @@ class FactorGraphCalibration:
 
     def _accel_measurement_accepted(self, pose_time: float, tau_I_initial: float) -> Tuple[bool, str]:
         query_time = pose_time + tau_I_initial
-        specific_force = _interpolate_vector(self._imu_timestamps, self._specific_force_imu, query_time)
+        specific_force = data_processing._interpolate_vector(self._imu_timestamps, self._specific_force_imu, query_time)
 
         if self._accel_norm_tolerance is not None:
             magnitude_error = abs(np.linalg.norm(specific_force) - np.linalg.norm(self._gravity_world))
@@ -919,7 +689,7 @@ class FactorGraphCalibration:
                 return False, f"gravity magnitude error {magnitude_error}"
 
         if self._accel_gyro_threshold is not None and self._angular_velocity_imu is not None:
-            angular_velocity = _interpolate_vector(self._imu_timestamps, self._angular_velocity_imu, query_time)
+            angular_velocity = data_processing._interpolate_vector(self._imu_timestamps, self._angular_velocity_imu, query_time)
             if np.linalg.norm(angular_velocity) > self._accel_gyro_threshold:
                 return False, f"angular velocity norm {np.linalg.norm(angular_velocity)}"
 
@@ -943,6 +713,7 @@ class FactorGraphCalibration:
         bias_regularization_target: Sequence[float] = (0.0, 0.0, 0.0),
         tau_I_regularization_target: float = 0.0,
         tau_L_regularization_target: float = 0.0,
+        T_B_I_regularization_target: Any = None,
         is_rolling_window: bool = False,
     ):
         """
@@ -955,12 +726,13 @@ class FactorGraphCalibration:
         self._pose_timestamps, self._imu_timestamps, self._angular_velocity_imu, self._specific_force_imu, self._lidar_timestamps = validated
         self._lidar_odometry_poses = None if lidar_odometry_poses is None else list(lidar_odometry_poses)
 
-        T_B_I_initial = np.eye(4) if T_B_I_initial is None else _as_pose_matrix(T_B_I_initial)
-        T_B_L_initial = np.eye(4) if T_B_L_initial is None else _as_pose_matrix(T_B_L_initial)
-        bias_initial = _as_vector3(bias_initial, "bias_initial")
+        T_B_I_initial = np.eye(4) if T_B_I_initial is None else data_processing._as_pose_matrix(T_B_I_initial)
+        T_B_I_regularization_target = T_B_I_initial if T_B_I_regularization_target is None else data_processing._as_pose_matrix(T_B_I_regularization_target)
+        T_B_L_initial = np.eye(4) if T_B_L_initial is None else data_processing._as_pose_matrix(T_B_L_initial)
+        bias_initial = data_processing._as_vector3(bias_initial, "bias_initial")
         tau_I_initial = float(tau_I_initial)
         tau_L_initial = float(tau_L_initial)
-        self._initial_poses = self._initialize_trajectory_poses(pose_timestamps=self._pose_timestamps, states=states, first_pose=first_pose, imu_timestamps=self._imu_timestamps,
+        self._initial_poses = data_processing._initialize_trajectory_poses(pose_timestamps=self._pose_timestamps, states=states, first_pose=first_pose, imu_timestamps=self._imu_timestamps,
             angular_velocity_imu=self._angular_velocity_imu, T_B_I_initial=T_B_I_initial, bias_initial=bias_initial, tau_I_initial=tau_I_initial,
             lidar_timestamps=self._lidar_timestamps, lidar_odometry_poses=self._lidar_odometry_poses, T_B_L_initial=T_B_L_initial, tau_L_initial=tau_L_initial)
 
@@ -970,11 +742,12 @@ class FactorGraphCalibration:
             self._nodes_pose.append(node_id)
 
         # Add only the calibration nodes required by the enabled factor families.
+        requires_bias_node = self._include_gyro_factors or (self._include_accel_factors and self._acc_mode == "complex")
         if self._include_gyro_factors or self._include_accel_factors:
             self._node_T_B_I = self.add_pose_node(T_B_I_initial, anchor=self._T_B_I_anchor)
             self._node_tau_I = self.add_scalar_node(tau_I_initial, anchor=self._tau_I_anchor)
 
-        if self._include_gyro_factors:
+        if requires_bias_node:
             self._node_bias_g = self.add_vector_node(bias_initial, anchor=self._bias_anchor)
 
         if self._include_lidar_factors:
@@ -988,7 +761,7 @@ class FactorGraphCalibration:
         if not self._tau_L_anchor:
             self.add_tau_regularization_factor(self.node_tau_L, target=tau_L_regularization_target, information=self._tau_L_regularization_information, family="tau_L_prior")
         if not self._T_B_I_anchor:
-            self.add_pose_regularization_factor(self.node_T_B_I, T_B_I_initial, self._T_B_I_regularization_information, "T_B_I_prior")
+            self.add_pose_regularization_factor(self.node_T_B_I, T_B_I_regularization_target, self._T_B_I_regularization_information, "T_B_I_prior")
         if not self._T_B_L_anchor:
             self.add_pose_regularization_factor(self.node_T_B_L, T_B_L_initial, self._T_B_L_regularization_information, "T_B_L_prior")
 
@@ -1001,31 +774,66 @@ class FactorGraphCalibration:
 
                 pose_time_origin = float(self._pose_timestamps[pose_index])
                 pose_time_target = float(self._pose_timestamps[target_index])
-                support_indices = select_time_support_indices(self._imu_timestamps, pose_time_origin - self._imu_time_offset_margin, pose_time_target + self._imu_time_offset_margin, self._imu_samples_per_factor)
+                support_indices = data_processing.select_time_support_indices(self._imu_timestamps, pose_time_origin - self._imu_time_offset_margin, pose_time_target + self._imu_time_offset_margin, self._imu_samples_per_factor)
                 timestamps = self._imu_timestamps[support_indices]
                 measurements = self._angular_velocity_imu[support_indices]
-                information = _information_matrix(self._gyro_information, 3, factor_index)
+                information = data_processing._information_matrix(self._gyro_information, 3, factor_index)
 
                 factor_id = self.add_gyro_calibration_factor(pose_time_origin, pose_time_target, timestamps, measurements, self.nodes_pose[pose_index], self.nodes_pose[target_index], information)
                 self._factor_metadata["gyro"].append({"factor_id": factor_id, "pose_indices": (pose_index, target_index), "measurement_indices": support_indices})
 
-        # Add low-dynamic accelerometer factors to individual trajectory poses.
+        # Add accelerometer factors. Simple mode keeps the old low-dynamic
+        # gravity-only path; complex mode keeps dynamic measurements because
+        # rotational excitation is required to observe the lever arm.
         if self._include_accel_factors:
-            for factor_index, pose_index in enumerate(range(0, len(self.nodes_pose), self._accel_factor_stride)):
-                pose_time = float(self._pose_timestamps[pose_index])
-                accepted, rejection_reason = self._accel_measurement_accepted(pose_time, tau_I_initial)
+            if self._acc_mode == "simple":
+                for factor_index, pose_index in enumerate(range(0, len(self.nodes_pose), self._accel_factor_stride)):
+                    pose_time = float(self._pose_timestamps[pose_index])
+                    accepted, rejection_reason = self._accel_measurement_accepted(pose_time, tau_I_initial)
 
-                if not accepted:
-                    self._factor_metadata["accel"].append({"factor_id": None, "pose_index": pose_index, "accepted": False, "reason": rejection_reason})
-                    continue
+                    if not accepted:
+                        self._factor_metadata["accel"].append({"factor_id": None, "mode": "simple", "pose_index": pose_index, "accepted": False, "reason": rejection_reason})
+                        continue
 
-                support_indices = select_time_support_indices(self._imu_timestamps, pose_time - self._imu_time_offset_margin, pose_time + self._imu_time_offset_margin, self._imu_samples_per_factor)
-                timestamps = self._imu_timestamps[support_indices]
-                measurements = self._specific_force_imu[support_indices]
-                information = _information_matrix(self._accel_information, 3, factor_index)
+                    support_indices = data_processing.select_time_support_indices(self._imu_timestamps, pose_time - self._imu_time_offset_margin, pose_time + self._imu_time_offset_margin, self._imu_samples_per_factor)
+                    timestamps = self._imu_timestamps[support_indices]
+                    measurements = self._specific_force_imu[support_indices]
+                    information = data_processing._information_matrix(self._accel_information, 3, factor_index)
 
-                factor_id = self.add_accel_calibration_factor(pose_time, timestamps, measurements, self.nodes_pose[pose_index], information)
-                self._factor_metadata["accel"].append({"factor_id": factor_id, "pose_index": pose_index, "accepted": True, "measurement_indices": support_indices})
+                    factor_id = self.add_accel_calibration_factor(pose_time, timestamps, measurements, self.nodes_pose[pose_index], information)
+                    self._factor_metadata["accel"].append({"factor_id": factor_id, "mode": "simple", "pose_index": pose_index, "accepted": True, "measurement_indices": support_indices})
+            elif self._acc_mode == "complex":
+                if len(self.nodes_pose) < 3:
+                    raise ValueError("acc_mode='complex' requires at least three trajectory poses")
+
+                for factor_index, pose_index in enumerate(range(1, len(self.nodes_pose) - 1, self._accel_factor_stride)):
+                    pose_time_previous = float(self._pose_timestamps[pose_index - 1])
+                    pose_time = float(self._pose_timestamps[pose_index])
+                    pose_time_next = float(self._pose_timestamps[pose_index + 1])
+                    support_indices = data_processing.select_time_support_indices(self._imu_timestamps, pose_time - self._imu_time_offset_margin, pose_time + self._imu_time_offset_margin, self._imu_samples_per_factor)
+                    timestamps = self._imu_timestamps[support_indices]
+                    accelerometer_measurements = self._specific_force_imu[support_indices]
+                    gyroscope_measurements = self._angular_velocity_imu[support_indices]
+                    information = data_processing._information_matrix(self._accel_information, 3, factor_index)
+
+                    factor_id = self.add_accel_lever_arm_calibration_factor(
+                        pose_time_previous,
+                        pose_time,
+                        pose_time_next,
+                        timestamps,
+                        accelerometer_measurements,
+                        gyroscope_measurements,
+                        self.nodes_pose[pose_index - 1],
+                        self.nodes_pose[pose_index],
+                        self.nodes_pose[pose_index + 1],
+                        information,
+                    )
+                    self._factor_metadata["accel"].append({
+                        "factor_id": factor_id,
+                        "mode": "complex",
+                        "pose_indices": (pose_index - 1, pose_index, pose_index + 1),
+                        "measurement_indices": support_indices,
+                    })
 
         # Add LiDAR relative-pose factors between selected consecutive trajectory poses.
         if self._include_lidar_factors:
@@ -1036,10 +844,10 @@ class FactorGraphCalibration:
 
                 pose_time_origin = float(self._pose_timestamps[pose_index])
                 pose_time_target = float(self._pose_timestamps[target_index])
-                support_indices = select_time_support_indices(self._lidar_timestamps, pose_time_origin - self._lidar_time_offset_margin, pose_time_target + self._lidar_time_offset_margin, self._lidar_samples_per_factor)
+                support_indices = data_processing.select_time_support_indices(self._lidar_timestamps, pose_time_origin - self._lidar_time_offset_margin, pose_time_target + self._lidar_time_offset_margin, self._lidar_samples_per_factor)
                 timestamps = self._lidar_timestamps[support_indices]
                 measurements = [self._lidar_odometry_poses[index] for index in support_indices]
-                information = _information_matrix(self._lidar_information, 6, factor_index)
+                information = data_processing._information_matrix(self._lidar_information, 6, factor_index)
 
                 factor_id = self.add_lidar_calibration_factor(pose_time_origin, pose_time_target, timestamps, measurements, self.nodes_pose[pose_index], self.nodes_pose[target_index], information)
                 self._factor_metadata["lidar"].append({"factor_id": factor_id, "pose_indices": (pose_index, target_index), "measurement_indices": support_indices})
@@ -1080,6 +888,41 @@ class FactorGraphCalibration:
         return self.states
 
     def _create_window_result(self, window_index: int, window_start: float, window_end: float, chi2_before: float) -> CalibrationWindowResult:
+        numerical_result = self._current_numerical_calibration_result
+        numerical_T_B_I_initial = None
+        numerical_tau_I_initial = None
+        numerical_T_B_I_prior = None
+        numerical_tau_I_prior = None
+        numerical_calibration_used_as_initial = False
+        numerical_calibration_used_as_prior = False
+        numerical_rotation_rssd = None
+        numerical_residual_rmse = None
+        numerical_excitation_singular_values = None
+        numerical_calibration_success = None
+        numerical_calibration_message = None
+
+        if numerical_result is not None:
+            numerical_calibration_success = bool(numerical_result.success)
+            numerical_calibration_message = numerical_result.message
+
+            if numerical_result.success:
+                numerical_T_B_I = None if numerical_result.T_B_I is None else numerical_result.T_B_I.copy()
+                numerical_tau_I = None if numerical_result.tau_I is None else float(numerical_result.tau_I)
+
+                if self._use_numerical_calibration_initial:
+                    numerical_T_B_I_initial = None if numerical_T_B_I is None else numerical_T_B_I.copy()
+                    numerical_tau_I_initial = numerical_tau_I
+                    numerical_calibration_used_as_initial = True
+
+                if self._use_numerical_calibration_prior:
+                    numerical_T_B_I_prior = None if numerical_T_B_I is None else numerical_T_B_I.copy()
+                    numerical_tau_I_prior = numerical_tau_I
+                    numerical_calibration_used_as_prior = True
+
+                numerical_rotation_rssd = None if numerical_result.spatial_rssd is None else float(numerical_result.spatial_rssd)
+                numerical_residual_rmse = None if numerical_result.residual_vector_rmse is None else float(numerical_result.residual_vector_rmse)
+                numerical_excitation_singular_values = numerical_result.excitation_singular_values.copy()
+
         return CalibrationWindowResult(
             window_index=window_index,
             window_start=float(window_start),
@@ -1094,6 +937,18 @@ class FactorGraphCalibration:
             chi2_before=float(chi2_before),
             chi2_after=float(self.chi2),
             factor_counts=self.factor_counts,
+            numerical_T_B_I_initial=numerical_T_B_I_initial,
+            numerical_tau_I_initial=numerical_tau_I_initial,
+            numerical_T_B_I_prior=numerical_T_B_I_prior,
+            numerical_tau_I_prior=numerical_tau_I_prior,
+            numerical_calibration_used_as_initial=numerical_calibration_used_as_initial,
+            numerical_calibration_used_as_prior=numerical_calibration_used_as_prior,
+            numerical_rotation_rssd=numerical_rotation_rssd,
+            numerical_residual_rmse=numerical_residual_rmse,
+            numerical_excitation_singular_values=numerical_excitation_singular_values,
+            numerical_calibration_success=numerical_calibration_success,
+            numerical_calibration_message=numerical_calibration_message,
+            numerical_calibration_result=numerical_result,
         )
 
     def generate_filter(self, verbose: int = 0, **build_kwargs) -> CalibrationWindowResult:
@@ -1167,7 +1022,7 @@ class FactorGraphCalibration:
             if len(window_states) == 0:
                 first_window_index = int(window_pose_indices[0])
                 prefix_timestamps = pose_timestamps[:first_window_index + 1]
-                prefix_poses = self._initialize_trajectory_poses(
+                prefix_poses = data_processing._initialize_trajectory_poses(
                     pose_timestamps=prefix_timestamps,
                     states=supplied_states,
                     first_pose=first_pose,
@@ -1183,7 +1038,7 @@ class FactorGraphCalibration:
                 )
                 window_states = [prefix_poses[-1]]
 
-        return self._initialize_trajectory_poses(
+        return data_processing._initialize_trajectory_poses(
             pose_timestamps=window_pose_timestamps,
             states=window_states,
             first_pose=window_states[0],
@@ -1257,11 +1112,60 @@ class FactorGraphCalibration:
         if len(window_pose_indices) == 0:
             raise ValueError(f"No trajectory poses lie inside rolling window [{window_start}, {window_end}]")
 
-        T_B_I_initial = self._rolling_calibration_initial("T_B_I", np.eye(4) if T_B_I_initial is None else T_B_I_initial)
+        # Start from the previous rolling calibration. For the first window these
+        # values fall back to the caller-supplied initial calibration.
+        T_B_I_previous = self._rolling_calibration_initial("T_B_I", np.eye(4) if T_B_I_initial is None else T_B_I_initial)
         T_B_L_initial = self._rolling_calibration_initial("T_B_L", np.eye(4) if T_B_L_initial is None else T_B_L_initial)
-        bias_initial = self._rolling_calibration_initial("bias_g", _as_vector3(bias_initial, "bias_initial"))
-        tau_I_initial = self._rolling_calibration_initial("tau_I", float(tau_I_initial))
+        bias_initial = self._rolling_calibration_initial("bias_g", data_processing._as_vector3(bias_initial, "bias_initial"))
+        tau_I_previous = self._rolling_calibration_initial("tau_I", float(tau_I_initial))
         tau_L_initial = self._rolling_calibration_initial("tau_L", float(tau_L_initial))
+
+        T_B_I_initial = data_processing._as_pose_matrix(T_B_I_previous).copy()
+        tau_I_initial = float(tau_I_previous)
+
+        # By default the soft regularization prior remains centered on the previous
+        # rolling estimate, even when numerical calibration supplies a new graph
+        # initialization. This keeps "where LM starts" independent from "where the
+        # prior pulls the solution".
+        T_B_I_regularization_target = data_processing._as_pose_matrix(T_B_I_previous).copy()
+        tau_I_regularization_target = float(tau_I_previous)
+
+        numerical_result = None
+        self._current_numerical_calibration_result = None
+        use_numerical_calibration = self._use_numerical_calibration_initial or self._use_numerical_calibration_prior
+
+        if use_numerical_calibration:
+            numerical_result = estimate_imu_calibration_numerical(
+                window_start=window_start,
+                window_end=window_end,
+                imu_timestamps=imu_timestamps,
+                angular_velocity_imu=angular_velocity_imu,
+                lidar_timestamps=lidar_timestamps,
+                lidar_odometry_poses=lidar_odometry_poses,
+                T_B_L=T_B_L_initial,
+                bias_g=bias_initial,
+                bias_mode="provided",
+                T_B_I_previous=T_B_I_previous,
+                config=self._numerical_calibration_config,
+            )
+            self._current_numerical_calibration_result = numerical_result
+
+            if numerical_result.success:
+                # Numerical initialization changes only the graph starting point.
+                # It is enabled by default.
+                if self._use_numerical_calibration_initial:
+                    T_B_I_initial = numerical_result.T_B_I.copy()
+                    tau_I_initial = float(numerical_result.tau_I)
+
+                # Numerical prior changes only the regularization target. It is
+                # disabled by default, so the prior normally remains the previous
+                # rolling calibration.
+                if self._use_numerical_calibration_prior:
+                    T_B_I_regularization_target = numerical_result.T_B_I.copy()
+                    tau_I_regularization_target = float(numerical_result.tau_I)
+
+            elif verbose > 0:
+                print(f"Numerical calibration failed in window {window_index}: {numerical_result.message}")
 
         # Initialize the window from a consecutive solved prefix when available.
         # Otherwise propagate supplied global states up to the first window pose.
@@ -1281,6 +1185,11 @@ class FactorGraphCalibration:
             T_B_L_initial=T_B_L_initial,
             tau_L_initial=tau_L_initial,
         )
+        # import calib_observability
+        # fig, axis = calib_observability.plotting.plot_trajectory_2d(
+        #     window_initial_poses,
+        #     title="Accumulated LiDAR trajectory",
+        #     label="LiDAR odometry",)
 
         # Build the current window from global sensor streams so factors retain their complete temporal support.
         self.build_problem(
@@ -1295,10 +1204,15 @@ class FactorGraphCalibration:
             T_B_I_initial=T_B_I_initial,
             T_B_L_initial=T_B_L_initial,
             bias_initial=bias_initial,
+            bias_regularization_target=bias_initial,
             tau_I_initial=tau_I_initial,
+            tau_I_regularization_target=tau_I_regularization_target,
+            T_B_I_regularization_target=T_B_I_regularization_target,
             tau_L_initial=tau_L_initial,
+            tau_L_regularization_target=tau_L_initial,
             is_rolling_window=True,
         )
+        self._current_numerical_calibration_result = numerical_result
 
         if verbose > 0:
             print(f"WINDOW {window_index}, RAW [{window_start}, {window_end}]:")
@@ -1431,6 +1345,8 @@ class FactorGraphCalibration:
         print(f"Chi2 error = {self.chi2}")
         print(f"Nodes = {self._filter_object.number_nodes()}, factors = {self._filter_object.number_factors()}")
         print(f"Factor counts = {self.factor_counts}")
+        if self._include_accel_factors:
+            print(f"Accelerometer mode: {self.acc_mode}")
 
         if len(self.nodes_pose) > 0:
             pose_step = int(len(self.nodes_pose) / pose_count)

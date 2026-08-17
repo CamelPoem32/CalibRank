@@ -11,6 +11,10 @@ from typing import Any, Sequence
 
 import mrob
 import numpy as np
+from numba import njit
+from scipy.spatial.transform import Rotation as R
+
+import transform
 
 
 def _as_se3_array(se3s: Sequence[Any], name: str = "se3s") -> np.ndarray:
@@ -369,3 +373,79 @@ def RPE_SE3_translation(
     Calculate relative translation error in meters.
     """
     return calculate_relative_se3_translation_distances(se3s1, se3s2, increment)
+
+@njit
+def wrap_angle(angle):
+    """
+    Wraps the given angle to the range [-pi, +pi].
+
+    :param angle: The angle (in rad) to wrap (can be unbounded).
+    :return: The wrapped angle (guaranteed to in [-pi, +pi]).
+    """
+
+    pi2 = 2 * np.pi
+
+    while angle < -np.pi:
+        angle += pi2
+
+    while angle >= np.pi:
+        angle -= pi2
+
+    return angle
+
+@njit
+def wrap_angles(angles):
+    for i in range(len(angles)):
+        angles[i] = wrap_angle(angles[i])
+    return angles
+
+def scipy_rotation(w1, w2):
+    '''
+    Finds best rotation matrix 1to2 (det=1): w2 = M @ w1
+
+    param: w1, w2 (array) - arrays of the same shape
+
+    return: (array 3x3) M
+    '''
+    M_1_to_2, rssd = R.align_vectors(w2, w1)
+    M_1_to_2 = M_1_to_2.as_matrix()
+
+    return M_1_to_2
+
+def steady_samples_number(data, max_idle_val=5e-2, axis=-1):
+    norms = np.linalg.norm(data, axis=axis)
+    last_steady = np.argmax(norms >= max_idle_val)
+    if last_steady == 0 and np.all(norms < max_idle_val): last_steady = len(data)
+    return last_steady
+
+@njit
+def RMSE(errors):
+    '''
+    Calculate Root Mean Squared of the given errors array
+    '''
+    pow = np.power(errors, 2)
+    mean = np.array([np.mean(pow[:, i]) for i in range(len(pow[0]))])
+    return np.sqrt(mean)
+
+def rotate_quats(quats, R, right=False):
+    '''
+    Left multiplication of SO3(quat) by R -> R @ SO3(quat)
+    
+    param: quats (array Nx4) - quaternions [w, x, y ,z]
+    param: R (array 3x3) - rotation matrix
+    param: right (bool) - is matmul right (SO3(q) @ R) or left (R @ SO3(q))? Default=False
+
+    return: (array Nx4) qs [w, x, y ,z]
+    '''
+    qs = np.empty_like(quats)
+    Rs = transform.quats_to_so3s(quats)
+    Rs_rot = np.empty_like(Rs)
+    for i, q in enumerate(quats):
+        if right: 
+            Rs_rot[i] = Rs[i] @ R
+        else:
+            Rs_rot[i] = R @ Rs[i]
+        
+    qs = transform.so3s_to_quats(Rs_rot)
+    
+    return qs

@@ -608,3 +608,350 @@ def velocities_to_se3_vectors(
     )
 
     return se3_to_se3_vectors(se3s)
+
+def transform_se3s(
+    array: np.ndarray,
+    matrix: np.ndarray,
+    left: bool = True,
+) -> np.ndarray:
+    '''
+    Transform an array of SE(3) matrices by one SE(3) matrix.
+
+    For left multiplication:
+
+        transformed[i] = matrix @ array[i]
+
+    For right multiplication:
+
+        transformed[i] = array[i] @ matrix
+
+    Parameters
+    ----------
+    array
+        SE(3) matrices with shape (..., 4, 4).
+
+    matrix
+        Transformation matrix with shape (4, 4).
+
+    left
+        Apply the transformation from the left when True and from the right
+        when False.
+
+    Returns
+    -------
+    transformed
+        Transformed SE(3) matrices with the same shape as array.
+    '''
+
+    SE3s = np.asarray(array, dtype=float)
+    T = np.asarray(matrix, dtype=float)
+
+    if SE3s.ndim < 2 or SE3s.shape[-2:] != (4, 4):
+        raise ValueError("array must have shape (..., 4, 4)")
+
+    if T.shape != (4, 4):
+        raise ValueError("matrix must have shape (4, 4)")
+
+    if left:
+        transformed_SE3s = T @ SE3s
+    else:
+        transformed_SE3s = SE3s @ T
+
+    return transformed_SE3s
+
+
+def rotate_so3s(
+    array: np.ndarray,
+    matrix: np.ndarray,
+    left: bool = True,
+) -> np.ndarray:
+    '''
+    Rotate an array of SO(3) matrices by one SO(3) matrix.
+
+    For left multiplication:
+
+        rotated[i] = matrix @ array[i]
+
+    For right multiplication:
+
+        rotated[i] = array[i] @ matrix
+
+    Parameters
+    ----------
+    array
+        SO(3) matrices with shape (..., 3, 3).
+
+    matrix
+        Rotation matrix with shape (3, 3).
+
+    left
+        Apply the rotation from the left when True and from the right when
+        False.
+
+    Returns
+    -------
+    rotated
+        Rotated SO(3) matrices with the same shape as array.
+    '''
+
+    SO3s = np.asarray(array, dtype=float)
+    R = np.asarray(matrix, dtype=float)
+
+    if SO3s.ndim < 2 or SO3s.shape[-2:] != (3, 3):
+        raise ValueError("array must have shape (..., 3, 3)")
+
+    if R.shape != (3, 3):
+        raise ValueError("matrix must have shape (3, 3)")
+
+    if left:
+        rotated_SO3s = R @ SO3s
+    else:
+        rotated_SO3s = SO3s @ R
+
+    return rotated_SO3s
+
+def quat_to_so3(quat):
+    '''
+    Transform quat [w, x, y, z] to SO3 3x3
+    '''
+    return mrob.quat_to_so3(np.roll(quat, -1))
+
+def quats_to_so3s(quats):
+    '''
+    Transform quats [w, x, y, z] to SO3s 3x3
+    '''
+    return np.array([mrob.quat_to_so3(quat) for quat in np.roll(quats, -1, axis=1)])
+
+def so3_to_quat(so3):
+    '''
+    Transform SO3 3x3 to quat [w, x, y, z]
+    '''
+    return np.roll(mrob.so3_to_quat(so3), 1)
+
+def so3s_to_quats(so3s):
+    '''
+    Transform SO3s 3x3 to quats [w, x, y, z]
+    '''
+    return np.roll(np.array([mrob.so3_to_quat(so3) for so3 in so3s]), 1, axis=1)
+
+def quat_to_angvel(t, t_next, quat, quat_next):
+    '''
+    Transforming quatenion to angular velocities
+
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: quat (array 4) - quaternion [w, x, y, z]
+    param: quat_next (array 4) - next quaternion [w, x, y, z]
+
+    return: ang_vel (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+
+    R1 = mrob.quat_to_so3(np.roll(quat, -1))                # [w x y z] to [x y z w]
+    R2 = mrob.quat_to_so3(np.roll(quat_next, -1))
+
+    delta_R = np.linalg.inv(R1) @ R2
+    delta_teta = mrob.SO3.Ln(mrob.SO3(delta_R))
+    delta_t = t_next - t
+
+    ang_vel = delta_teta / delta_t
+
+    return ang_vel
+
+def _q_xyzw_to_w(t, t_next, quat_xyzw, quat_xyzw_next):
+    '''
+    Transforming quatenion to angular velocities
+
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: quat_xyzw (array 4) - quaternion [x, y, z, w]
+    param: quat_xyzw_next (array 4) - next quaternion [x, y, z, w]
+
+    return: ang_vel (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+
+    R1 = mrob.quat_to_so3(quat_xyzw)
+    R2 = mrob.quat_to_so3(quat_xyzw_next)
+
+    delta_R = R1.T @ R2
+    delta_teta = mrob.SO3.Ln(mrob.SO3(delta_R))
+    delta_t = t_next - t
+
+    ang_vel = delta_teta / delta_t
+
+    return ang_vel
+
+def quats_to_angvels(timestamps, quats):
+    '''
+    Transforming quatenions to angular velocities
+
+    param: timestamps (array N) - timestamps
+    param: quats (array Nx4) - quaternions [w, x, y, z]
+
+    return: ang_vels (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+    quats_xyzw = np.roll(quats, -1, axis=1)                # [w x y z] to [x y z w]
+    ang_vels = np.array([_q_xyzw_to_w(timestamps[i], timestamps[i+1], quats_xyzw[i], quats_xyzw[i+1]) for i in range(len(timestamps) - 1)])
+
+    return ang_vels
+
+def quat_to_angvel_centered(t_prev, t_next, quat_prev, quat_next):
+    '''
+    Transforming quatenion to angular velocities
+
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: quat (array 4) - quaternion [w, x, y, z]
+    param: quat_next (array 4) - next quaternion [w, x, y, z]
+
+    return: ang_vel (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+
+    R0 = mrob.quat_to_so3(np.roll(quat_prev, -1))                # [w x y z] to [x y z w]
+    R2 = mrob.quat_to_so3(np.roll(quat_next, -1))
+
+    delta_R = R0.T @ R2
+    delta_teta = mrob.SO3.Ln(mrob.SO3(delta_R))
+    delta_t = t_next - t_prev
+
+    ang_vel = delta_teta / delta_t
+
+    return ang_vel
+
+def _q_xyzw_to_w_centered(t_prev, t_next, quat_xyzw_prev, quat_xyzw_next):
+    '''
+    Transforming quatenion to angular velocities
+
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: quat_xyzw_prev (array 4) - quaternion [x, y, z, w]
+    param: quat_xyzw_next (array 4) - next quaternion [x, y, z, w]
+
+    return: ang_vel (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+
+    R0 = mrob.quat_to_so3(quat_xyzw_prev)
+    R2 = mrob.quat_to_so3(quat_xyzw_next)
+
+    delta_R = R0.T @ R2
+    delta_teta = mrob.SO3.Ln(mrob.SO3(delta_R))
+    delta_t = t_next - t_prev
+
+    ang_vel = delta_teta / delta_t
+
+    return ang_vel
+
+def quats_to_angvels_centered(timestamps, quats):
+    '''
+    Transforming quatenions to angular velocities
+
+    param: timestamps (array N) - timestamps
+    param: quats (array Nx4) - quaternions [w, x, y, z]
+
+    return: ang_vels (rad/s)
+    '''
+
+    # First transform quaternions to SO3, then find delta_R and 
+    # use mrob.SO3.Ln to go from SO3 to R3 - angles
+    # and finally divide d_teta by d_time to get angular velocities
+    ang_vels = np.empty((len(timestamps) - 1, 3))
+    quats_xyzw = np.roll(quats, -1, axis=1)                # [w x y z] to [x y z w]
+    ang_vels[0] = quat_to_angvel(timestamps[0], timestamps[1], quats_xyzw[0], quats_xyzw[1])
+    for i in range(1, len(timestamps) - 1):
+        ang_vels[i] = _q_xyzw_to_w_centered(timestamps[i-1], timestamps[i+1], quats_xyzw[i-1], quats_xyzw[i+1])
+
+    return ang_vels
+
+def angvel_to_quat(t, t_next, angvel, quat):
+    '''
+    Transforming angular velocities to quaternions
+    
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: angvel - array of angular velocitiy components [x, y, z]
+    param: quat - initial attitude, [w, x, y, z]
+
+    return: quat_next [w, x, y, z]
+    '''
+
+    # First multiply angular velocities by d_t, then 
+    # use mrob.SO3 to go from R3 to SO3 with exponential mapping
+    # and finally get R_next = R @ delta_R and with mrob.so3_to_quat go to quaternion
+    delta_t = t_next - t
+    delta_teta = angvel * delta_t
+    delta_R = mrob.SO3(delta_teta).R()
+
+    R = mrob.quat_to_so3(np.roll(quat, -1))
+    R_next = R @ delta_R
+
+    quat_next = mrob.so3_to_quat(R_next)
+
+    return np.roll(quat_next, 1)
+
+def _w_to_q_xyzw(t, t_next, angvel, quat_xyzw):
+    '''
+    Transforming angular velocities to quaternions
+    
+    param: t (int) - timestamp
+    param: t_next (int) - next timestamp
+    param: angvel - array of angular velocitiy components [x, y, z]
+    param: quat_xyzw - initial attitude, [x, y, z, w]
+
+    return: quat_next [x, y, z, w]
+    '''
+
+    # First multiply angular velocities by d_t, then 
+    # use mrob.SO3 to go from R3 to SO3 with exponential mapping
+    # and finally get R_next = R @ delta_R and with mrob.so3_to_quat go to quaternion
+    delta_t = t_next - t
+    delta_teta = angvel * delta_t
+    delta_R = mrob.SO3(delta_teta).R()
+
+    R = mrob.quat_to_so3(quat_xyzw)
+    R_next = R @ delta_R
+
+    quat_next = mrob.so3_to_quat(R_next)
+
+    return quat_next
+
+def angvels_to_quats(timestamps, angvels, quat0):
+    '''
+    Transforming angular velocities to quaternions
+    First multiply angular velocities by d_t, then 
+    use mrob.SO3 to go from R3 to SO3 with exponential mapping
+    and finally get R_next = R @ delta_R and with mrob.so3_to_quat go to quaternion
+
+    param: timestamps - array of timestamps for angvels
+    param: angvels - array of angular velocities [x, y, z]
+    param: quat0 - initial attitude, [w, x, y, z]
+    
+    Return: quaternions of rotations with angvels [w, x, y, z]
+    '''
+    quats_xyzw = np.empty((len(timestamps), 4))
+    quats_xyzw[0] = np.roll(quat0, -1)
+
+    for i in range(1, len(timestamps)):
+        quats_xyzw[i] = _w_to_q_xyzw(timestamps[i-1], timestamps[i], angvels[i-1], quats_xyzw[i-1])
+
+    quats = np.roll(quats_xyzw, 1, axis=1)
+    
+    return quats
