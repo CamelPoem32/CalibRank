@@ -18,7 +18,10 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.spatial.transform import Rotation
 
-import transform
+try:
+    import transform
+except ImportError:  # pragma: no cover - supports importing this module as src.numerical_calibration.
+    from src import transform
 
 BiasMode = Literal['provided', 'stationary']
 

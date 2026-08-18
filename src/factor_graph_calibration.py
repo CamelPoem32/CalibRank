@@ -8,8 +8,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import mrob
 import numpy as np
 
-import data_processing
-from numerical_calibration import NumericalCalibrationConfig, estimate_imu_calibration_numerical
+try:
+    import data_processing
+    from numerical_calibration import NumericalCalibrationConfig, estimate_imu_calibration_numerical
+except ImportError:  # pragma: no cover - supports importing this module as src.factor_graph_calibration.
+    from src import data_processing
+    from src.numerical_calibration import NumericalCalibrationConfig, estimate_imu_calibration_numerical
 
 
 

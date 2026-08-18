@@ -7,8 +7,12 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import mrob
 import numpy as np
 from numba import njit
-from tools_ahrs import plot
-import transform
+try:
+    from tools_ahrs import plot
+    import transform
+except ImportError:  # pragma: no cover - supports importing this module as src.data_processing.
+    from src.tools_ahrs import plot
+    from src import transform
 
 def subsample_indices(indices: Iterable[int], final_length: Optional[int]) -> np.ndarray:
     """
