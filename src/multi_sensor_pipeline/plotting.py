@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import mrob
 import numpy as np
 
-from .streams import ComplexAccelStream, GyroStream, LidarOdometryStream, SimpleAccelStream
+from .streams import ComplexAccelStream, GyroStream, LidarOdometryStream, PoseObservationStream, SimpleAccelStream
 from .variables import VariableKey, VariableType
 
 
@@ -46,12 +46,16 @@ def plot_stream_measurements(streams: Sequence[Any]) -> tuple[plt.Figure, np.nda
             positions = np.asarray([pose[:3, 3] for pose in stream.odometry_poses], dtype=float)
             for axis, component in enumerate(component_names):
                 axes[2].plot(stream.timestamps, positions[:, axis], label=f"{stream.stream_name} p_{component}", alpha=0.85)
+        if isinstance(stream, PoseObservationStream):
+            positions = np.asarray([pose[:3, 3] for pose in stream.poses], dtype=float)
+            for axis, component in enumerate(component_names):
+                axes[2].plot(stream.timestamps, positions[:, axis], label=f"{stream.stream_name} p_{component}", alpha=0.85, linestyle="--")
 
     axes[0].set_title("Gyroscope Streams")
     axes[0].set_ylabel("rad/s")
     axes[1].set_title("Accelerometer Streams")
     axes[1].set_ylabel("m/s^2")
-    axes[2].set_title("Accumulated LiDAR Odometry Translation")
+    axes[2].set_title("LiDAR Odometry / Absolute Pose Translation")
     axes[2].set_ylabel("m")
     axes[2].set_xlabel("time, s")
     for axis in axes:
@@ -125,59 +129,140 @@ def plot_calibration_estimates(
     *,
     reference_values: Mapping[VariableKey, Any] | None = None,
 ) -> tuple[plt.Figure, np.ndarray]:
-    """Plot calibration-variable estimates over rolling-window midpoints.
-
-    Args:
-        results: ``WindowResult`` objects returned by ``RollingGraph``.
-        variable_keys: Calibration variables to plot.
-        reference_values: Optional reference values keyed by ``VariableKey``.
-
-    Returns:
-        Matplotlib figure and axes.
-    """
+    """Plot calibration-variable estimates over rolling-window midpoints."""
 
     if len(results) == 0:
         raise ValueError("results must contain at least one rolling-window result")
+
     reference_values = {} if reference_values is None else dict(reference_values)
     window_times = _as_window_times(results)
-    fig, axes = plt.subplots(len(variable_keys), 1, figsize=(14, max(3, 2.8 * len(variable_keys))), sharex=True, squeeze=False)
+
+    fig, axes = plt.subplots(
+        len(variable_keys),
+        1,
+        figsize=(14, max(3, 2.8 * len(variable_keys))),
+        sharex=True,
+        squeeze=False,
+    )
     axes = axes[:, 0]
 
-    # Convert each variable into a readable Euclidean series: SE(3) tangent, scalar tau, or 3D bias.
+    ##################################################
+    # Convert and plot each available calibration history
+    ##################################################
+
     for axis, key in zip(axes, variable_keys):
-        values = [result.calibration_value(key) for result in results]
+        raw_values = [
+            result.calibration_value(key)
+            for result in results
+        ]
+
+        valid_mask = np.asarray(
+            [value is not None for value in raw_values],
+            dtype=bool,
+        )
+
+        if not np.any(valid_mask):
+            axis.text(
+                0.5,
+                0.5,
+                f"No stored values for {key.label}",
+                transform=axis.transAxes,
+                ha="center",
+                va="center",
+            )
+            axis.set_ylabel(key.label)
+            axis.grid(True, alpha=0.25)
+            continue
+
+        values = [
+            value
+            for value in raw_values
+            if value is not None
+        ]
+
+        variable_times = window_times[valid_mask]
+
         if key.variable_type == VariableType.EXTRINSIC:
-            series = np.asarray([mrob.SE3(value).Ln() for value in values], dtype=float)
+            series = np.asarray(
+                [
+                    mrob.SE3(
+                        np.asarray(value, dtype=float)
+                    ).Ln()
+                    for value in values
+                ],
+                dtype=float,
+            )
             labels = ("rx", "ry", "rz", "tx", "ty", "tz")
+
         elif key.variable_type == VariableType.TIME_OFFSET:
-            series = np.asarray(values, dtype=float).reshape(-1, 1)
+            series = np.asarray(
+                values,
+                dtype=float,
+            ).reshape(-1, 1)
             labels = ("tau",)
+
         elif key.variable_type == VariableType.GYRO_BIAS:
-            series = np.asarray(values, dtype=float).reshape(len(results), 3)
+            series = np.asarray(
+                values,
+                dtype=float,
+            ).reshape(len(values), 3)
             labels = ("bx", "by", "bz")
+
         else:
             continue
 
         for component_index, label in enumerate(labels):
-            axis.plot(window_times, series[:, component_index], marker="o", markersize=3, label=label)
+            axis.plot(
+                variable_times,
+                series[:, component_index],
+                marker="o",
+                markersize=3,
+                label=label,
+            )
+
+        ##################################################
+        # Overlay optional reference values
+        ##################################################
 
         if key in reference_values:
             reference = reference_values[key]
+
             if key.variable_type == VariableType.EXTRINSIC:
-                reference = mrob.SE3(reference).Ln()
+                reference = mrob.SE3(
+                    np.asarray(reference, dtype=float)
+                ).Ln()
+
             elif key.variable_type == VariableType.TIME_OFFSET:
-                reference = np.asarray([float(reference)])
+                reference = np.asarray(
+                    [float(reference)]
+                )
+
             else:
-                reference = np.asarray(reference, dtype=float).reshape(-1)
-            for component_index, label in enumerate(labels[: reference.size]):
-                axis.axhline(float(reference[component_index]), linestyle="--", linewidth=0.8, alpha=0.5)
+                reference = np.asarray(
+                    reference,
+                    dtype=float,
+                ).reshape(-1)
+
+            for component_index in range(
+                min(reference.size, len(labels))
+            ):
+                axis.axhline(
+                    float(reference[component_index]),
+                    linestyle="--",
+                    linewidth=0.8,
+                    alpha=0.5,
+                )
 
         axis.set_ylabel(key.label)
         axis.grid(True, alpha=0.25)
-        axis.legend(ncol=min(6, len(labels)), fontsize="small")
+        axis.legend(
+            ncol=min(6, len(labels)),
+            fontsize="small",
+        )
 
     axes[-1].set_xlabel("window midpoint time, s")
     fig.tight_layout()
+
     return fig, axes
 
 

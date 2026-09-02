@@ -15,7 +15,17 @@ from .variables import VariableKey, copy_variable_value
 
 @dataclass
 class RollingState:
-    """Warm-start state carried from one rolling graph window to the next."""
+    """
+    Warm-start state carried from one rolling graph window to the next.
+
+    Calibration values and pose_cache contain only the latest state required
+    for warm-starting subsequent windows.
+
+    output_pose_cache contains the stitched rolling trajectory.
+
+    window_results contains either complete WindowResult objects in debug mode
+    or lightweight trajectory-only WindowResult objects in normal mode.
+    """
 
     calibration_values: dict[VariableKey, Any] = field(default_factory=dict)
     pose_cache: dict[float, np.ndarray] = field(default_factory=dict)

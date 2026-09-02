@@ -96,9 +96,40 @@ class WindowResult:
         """Return a copy of one calibration value from this result."""
 
         key = key if isinstance(key, VariableKey) else VariableKey(key[0], key[1])
+
         if key not in self.calibration_values:
             return None
+
         return copy_variable_value(self.calibration_values[key])
+
+    def trajectory_only_copy(self) -> "WindowResult":
+        """
+        Return a lightweight rolling-history result.
+
+        Always keep the solved trajectory, calibration-variable estimates, and
+        compact scalar diagnostics. Calibration histories are tiny and are useful
+        for inspecting convergence even outside debug mode.
+
+        Drop graph metadata and numerical-calibration payloads in non-debug mode,
+        because those can contain substantially larger per-window structures.
+        """
+
+        return WindowResult(
+            window_index=int(self.window_index),
+            window_start=float(self.window_start),
+            window_end=float(self.window_end),
+            pose_timestamps=self.pose_timestamps.copy(),
+            trajectory_poses=self.trajectory_poses.copy(),
+            calibration_values={
+                key: copy_variable_value(value)
+                for key, value in self.calibration_values.items()
+            },
+            chi2_before=float(self.chi2_before),
+            chi2_after=float(self.chi2_after),
+            factor_counts=dict(self.factor_counts),
+            metadata=GraphMetadata(),
+            numerical_results={},
+        )
 
 
 class _CalibrationValueResolver:
@@ -220,17 +251,46 @@ class RollingGraph:
         trajectory_config: TrajectoryConfig | None = None,
         rolling_state: RollingState | None = None,
         numerical_calibration_config: NumericalCalibrationConfig | None = None,
+        debug: bool = False,
     ):
         self.streams = list(streams)
+
         self._sensors_explicitly_configured = sensors is not None
         self.sensors = self._normalize_sensors(sensors)
         self._validate_stream_sensors()
+
         self.variable_configs = normalize_variable_config_map(variable_configs)
-        self.solver_config = (SolverConfig() if solver_config is None else solver_config).normalized()
-        self.trajectory_config = TrajectoryConfig() if trajectory_config is None else trajectory_config
-        self.rolling_state = RollingState() if rolling_state is None else rolling_state
-        self.numerical_calibration_config = NumericalCalibrationConfig() if numerical_calibration_config is None else numerical_calibration_config
+
+        self.solver_config = (
+            SolverConfig()
+            if solver_config is None
+            else solver_config
+        ).normalized()
+
+        self.trajectory_config = (
+            TrajectoryConfig()
+            if trajectory_config is None
+            else trajectory_config
+        )
+
+        self.rolling_state = (
+            RollingState()
+            if rolling_state is None
+            else rolling_state
+        )
+
+        self.numerical_calibration_config = (
+            NumericalCalibrationConfig()
+            if numerical_calibration_config is None
+            else numerical_calibration_config
+        )
+
+        # Debug mode keeps complete per-window calibration, metadata, and numerical
+        # results. Normal mode keeps only trajectory history and small diagnostics.
+        self.debug = bool(debug)
+
         self._last_result: WindowResult | None = None
+
         self._reset_graph()
 
     def _normalize_sensors(self, sensors: Sequence[Sensor | str] | None) -> dict[str, Sensor]:
@@ -681,13 +741,52 @@ class RollingGraph:
         chi2_before = self.chi2
         self.solve_problem()
         result = self._create_result(window_index, window_start, window_end, chi2_before)
-        self.rolling_state.store_window_solution(result.pose_timestamps, result.trajectory_poses, result.calibration_values, result=result, metadata={"window_index": int(window_index), "window_start": float(window_start), "window_end": float(window_end)})
-        self._last_result = result
+        ##################################################
+        # Store state required by subsequent rolling windows
+        ##################################################
+
+        # Always preserve the latest calibration estimates separately because
+        # initial_source='optimized' needs them for the next rolling window.
+        #
+        # Keep the full WindowResult only in debug mode. In normal operation,
+        # retain only trajectory results and compact scalar diagnostics.
+        stored_result = (
+            result
+            if self.debug
+            else result.trajectory_only_copy()
+        )
+
+        self.rolling_state.store_window_solution(
+            result.pose_timestamps,
+            result.trajectory_poses,
+            result.calibration_values,
+            result=stored_result,
+            metadata=(
+                {
+                    "window_index": int(window_index),
+                    "window_start": float(window_start),
+                    "window_end": float(window_end),
+                }
+                if self.debug
+                else None
+            ),
+        )
+
+        # Do not retain another complete result object outside debug mode.
+        self._last_result = (
+            result
+            if self.debug
+            else stored_result
+        )
 
         if verbose > 0:
-            print(f"WINDOW {window_index}, FILTERED [{window_start}, {window_end}]:")
+            print(
+                f"WINDOW {window_index}, "
+                f"FILTERED [{window_start}, {window_end}]:"
+            )
             self.print_problem()
-        return result
+
+        return stored_result
 
     def _rolling_support_interval(self, pose_timestamps: np.ndarray) -> tuple[float, float]:
         safe_starts = [float(pose_timestamps[0])]
@@ -715,36 +814,123 @@ class RollingGraph:
         clear_previous: bool = True,
         verbose: int = 0,
     ) -> list[WindowResult]:
-        """Solve overlapping rolling windows and carry solved state into each next window."""
+        """
+        Solve overlapping rolling windows and carry solved state into each next window.
+
+        In normal mode, only lightweight trajectory-focused window results are
+        retained. Debug mode preserves complete calibration values, graph metadata,
+        numerical-calibration results, and the final mrob graph for inspection.
+        """
 
         if float(window_size) <= 0.0 or float(step_size) <= 0.0:
-            raise ValueError("window_size and step_size must be positive")
+            raise ValueError(
+                "window_size and step_size must be positive"
+            )
+
         if float(step_size) > float(window_size):
-            raise ValueError("step_size should not exceed window_size because rolling windows would not overlap")
-        pose_timestamps = self._validate_pose_timestamps(pose_timestamps)
+            raise ValueError(
+                "step_size should not exceed window_size "
+                "because rolling windows would not overlap"
+            )
+
+        pose_timestamps = self._validate_pose_timestamps(
+            pose_timestamps
+        )
+
         if clear_previous:
             self.clear_rolling_state()
 
-        required_start, required_end = self._rolling_support_interval(pose_timestamps)
+        required_start, required_end = (
+            self._rolling_support_interval(
+                pose_timestamps
+            )
+        )
+
+        ##################################################
+        # Generate rolling-window start times
+        ##################################################
+
         window_starts: list[float] = []
+
         current_start = required_start
+
         while current_start < required_end:
-            window_starts.append(float(current_start))
+            window_starts.append(
+                float(current_start)
+            )
+
             current_start += float(step_size)
 
-        for window_index, current_window_start in enumerate(window_starts):
-            current_window_end = min(current_window_start + float(window_size), required_end)
-            window_pose_indices = np.flatnonzero((pose_timestamps >= current_window_start) & (pose_timestamps <= current_window_end))
+        ##################################################
+        # Build, optimize, and commit every window
+        ##################################################
+
+        for window_index, current_window_start in enumerate(
+            window_starts
+        ):
+            current_window_end = min(
+                current_window_start + float(window_size),
+                required_end,
+            )
+
+            window_pose_indices = np.flatnonzero(
+                (pose_timestamps >= current_window_start)
+                & (pose_timestamps <= current_window_end)
+            )
+
             if len(window_pose_indices) == 0:
                 continue
 
-            result = self.generate_filter_window(window_index=window_index, window_start=current_window_start, window_end=current_window_end, pose_timestamps=pose_timestamps, states=states, first_pose=first_pose, verbose=verbose)
-            is_last_window = current_window_end >= required_end
-            commit_end = required_end if is_last_window else current_window_start + float(step_size)
-            self.rolling_state.commit_output_segment(result.pose_timestamps, result.trajectory_poses, commit_end=commit_end, include_end=is_last_window)
+            result = self.generate_filter_window(
+                window_index=window_index,
+                window_start=current_window_start,
+                window_end=current_window_end,
+                pose_timestamps=pose_timestamps,
+                states=states,
+                first_pose=first_pose,
+                verbose=verbose,
+            )
+
+            ##################################################
+            # Commit only the new non-overlapping output part
+            ##################################################
+
+            is_last_window = (
+                current_window_end >= required_end
+            )
+
+            commit_end = (
+                required_end
+                if is_last_window
+                else current_window_start + float(step_size)
+            )
+
+            self.rolling_state.commit_output_segment(
+                result.pose_timestamps,
+                result.trajectory_poses,
+                commit_end=commit_end,
+                include_end=is_last_window,
+            )
+
             if is_last_window:
                 break
-        return list(self.rolling_state.window_results)
+
+        ##################################################
+        # Detach results before optionally releasing native graph memory
+        ##################################################
+
+        results = list(
+            self.rolling_state.window_results
+        )
+
+        # The final FGraph can be large and, unlike previous window graphs,
+        # would otherwise remain referenced after the iterative run finishes.
+        # Keep it only in debug mode where post-solve graph inspection is useful.
+        if not self.debug:
+            self._reset_graph()
+            gc.collect()
+
+        return results
 
     def print_problem(self) -> None:
         """Print a compact graph summary for notebook diagnostics."""

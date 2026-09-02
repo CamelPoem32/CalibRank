@@ -596,6 +596,7 @@ def build_dataset_from_imported_sensor_streams(
     lidar_covariances: NDArray[np.float64] | None = None,
     imu_rotation_residual_std: float | None = None,
     true_poses_path = None,
+    poses_import_function = import_true_trajectory,
 ) -> ImportedCalibrationDataset:
     '''Build the observability dataset API from measured IMU and LiDAR streams.
 
@@ -807,7 +808,7 @@ def build_dataset_from_imported_sensor_streams(
             np.stack(cumulative_poses, axis=0),
         )
     else:
-        true_timestamps, true_trajectory = import_true_trajectory(true_poses_path)
+        true_timestamps, true_trajectory = poses_import_function(true_poses_path)
         trajectory = DiscretePoseTrajectory(
             true_timestamps,
             true_trajectory,
