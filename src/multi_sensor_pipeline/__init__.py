@@ -8,7 +8,7 @@ from .rolling_state import RollingState
 from .sensors import Sensor
 from .streams import AccelStream, ComplexAccelStream, GyroStream, LidarOdometryStream, LidarPoseStream, PoseObservationStream, RadarPoseStream, SimpleAccelStream
 from .variables import ValueSource, VariableConfig, VariableKey, VariableType
-from .plotting import plot_calibration_estimates, plot_rolling_trajectory, plot_stream_measurements, print_rolling_result_summary
+from .plotting import plot_calibration_estimates, plot_rolling_trajectory, plot_stream_measurements, print_rolling_result_summary, plot_trajectory_errors, plot_lidar_localization_benchmark_errors
 
 __all__ = [
     "Sensor",
@@ -33,4 +33,6 @@ __all__ = [
     "plot_rolling_trajectory",
     "plot_calibration_estimates",
     "print_rolling_result_summary",
+    "plot_trajectory_errors",
+    "plot_lidar_localization_benchmark_errors",
 ]

@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 
 MROB_ROOT = Path("/home/camel/Skoltech/Mobile_Robotics_Lab/mrob")
 if (MROB_ROOT / "mrobpy").exists():
@@ -16,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from multi_sensor_pipeline import (
     GyroStream,
     LidarOdometryStream,
+    LidarPoseStream,
     RollingGraph,
     Sensor,
     SimpleAccelStream,
@@ -60,6 +62,18 @@ def _base_streams():
         GyroStream(imu, imu_t, gyro, samples_per_factor=None, time_offset_margin=0.2),
         SimpleAccelStream(imu, imu_t, accel, samples_per_factor=None, time_offset_margin=0.2),
         LidarOdometryStream(lidar, lidar_t, lidar_poses, samples_per_factor=None, time_offset_margin=0.2),
+    ]
+
+
+def _pose_streams():
+    imu = Sensor("imu_0", kind="imu")
+    lidar = Sensor("lidar_0", kind="lidar")
+    imu_t, gyro, accel = _imu_measurements()
+    lidar_t, lidar_poses = _lidar_measurements()
+    return [
+        GyroStream(imu, imu_t, gyro, samples_per_factor=None, time_offset_margin=0.2),
+        SimpleAccelStream(imu, imu_t, accel, samples_per_factor=None, time_offset_margin=0.2),
+        LidarPoseStream(lidar, lidar_t, lidar_poses, samples_per_factor=None, time_offset_margin=0.2),
     ]
 
 
@@ -199,6 +213,108 @@ def test_numerical_calibration_is_reused_for_initial_and_prior():
     assert estimate.call_count == 1
     assert np.allclose(graph.states_init[graph.node_for(key)], T_numeric)
     assert np.allclose(graph.metadata.priors[0].prior_value, T_numeric)
+
+
+def test_numerical_calibration_can_initialize_from_lidar_pose_stream_without_odometry_stream():
+    pose_timestamps = np.array([0.0, 0.5, 1.0])
+    key = VariableKey("imu_0", VariableType.EXTRINSIC)
+    T_numeric = _pose(6.0)
+    lidar_t, lidar_poses = _lidar_measurements()
+    graph = RollingGraph(
+        streams=_pose_streams(),
+        variable_configs={key: VariableConfig(initial_source="numerical")},
+        solver_config=SolverConfig(maxIters=0),
+    )
+
+    with patch("multi_sensor_pipeline.rolling_graph.estimate_imu_calibration_numerical", return_value=_successful_result(T_numeric, 0.31)) as estimate, patch.object(LidarPoseStream, "add_factors", lambda self, context: None):
+        graph.build_problem(pose_timestamps=pose_timestamps, states=_poses(pose_timestamps))
+
+    assert estimate.call_count == 1
+    call_kwargs = estimate.call_args.kwargs
+    assert np.allclose(call_kwargs["lidar_timestamps"], lidar_t)
+    assert np.allclose(np.asarray(call_kwargs["lidar_odometry_poses"]), lidar_poses)
+    assert np.allclose(graph.states_init[graph.node_for(key)], T_numeric)
+    assert graph.metadata.priors == []
+
+
+def test_numerical_calibration_can_be_prior_from_lidar_pose_stream_without_odometry_stream():
+    pose_timestamps = np.array([0.0, 0.5, 1.0])
+    key = VariableKey("imu_0", VariableType.EXTRINSIC)
+    T_initial = _pose(1.0)
+    T_numeric_prior = _pose(7.0)
+    lidar_t, lidar_poses = _lidar_measurements()
+    graph = RollingGraph(
+        streams=_pose_streams(),
+        variable_configs={key: VariableConfig(initial_source="constant", initial_value=T_initial, prior_source="numerical", prior_information=1.0)},
+        solver_config=SolverConfig(maxIters=0),
+    )
+
+    with patch("multi_sensor_pipeline.rolling_graph.estimate_imu_calibration_numerical", return_value=_successful_result(T_numeric_prior, -0.08)) as estimate, patch.object(LidarPoseStream, "add_factors", lambda self, context: None):
+        graph.build_problem(pose_timestamps=pose_timestamps, states=_poses(pose_timestamps))
+
+    assert estimate.call_count == 1
+    call_kwargs = estimate.call_args.kwargs
+    assert np.allclose(call_kwargs["lidar_timestamps"], lidar_t)
+    assert np.allclose(np.asarray(call_kwargs["lidar_odometry_poses"]), lidar_poses)
+    assert np.allclose(graph.states_init[graph.node_for(key)], T_initial)
+    assert np.allclose(graph.metadata.priors[0].prior_value, T_numeric_prior)
+    assert graph.metadata.priors[0].prior_source == ValueSource.NUMERICAL
+
+
+def test_lidar_pose_stream_can_seed_trajectory_without_lidar_odometry_stream():
+    pose_timestamps = np.array([0.0, 0.5, 1.0])
+    graph = RollingGraph(
+        streams=_pose_streams(),
+        solver_config=SolverConfig(maxIters=0),
+        trajectory_config=TrajectoryConfig(use_imu_gyr=False),
+    )
+
+    with patch.object(LidarPoseStream, "add_factors", lambda self, context: None):
+        graph.build_problem(pose_timestamps=pose_timestamps, first_pose=_pose(0.0))
+
+    assert np.allclose(graph.trajectory_poses[:, :3, 3], _poses(pose_timestamps)[:, :3, 3])
+
+
+def test_numerical_calibration_missing_lidar_message_mentions_numerical_pose_data():
+    pose_timestamps = np.array([0.0, 0.5, 1.0])
+    imu_t, gyro, _ = _imu_measurements()
+    key = VariableKey("imu_0", VariableType.EXTRINSIC)
+    graph = RollingGraph(
+        streams=[GyroStream("imu_0", imu_t, gyro, samples_per_factor=None, time_offset_margin=0.2)],
+        variable_configs={key: VariableConfig(initial_source="numerical")},
+        solver_config=SolverConfig(maxIters=0),
+        trajectory_config=TrajectoryConfig(use_imu_gyr=True),
+    )
+
+    with pytest.raises(ValueError, match="no LiDAR stream exposing numerical pose data"):
+        graph.build_problem(pose_timestamps=pose_timestamps, states=_poses(pose_timestamps))
+
+
+def test_numerical_source_on_lidar_variables_falls_back_to_configured_values():
+    pose_timestamps = np.array([0.0, 0.5, 1.0])
+    lidar_ext_key = VariableKey("lidar_0", VariableType.EXTRINSIC)
+    lidar_tau_key = VariableKey("lidar_0", VariableType.TIME_OFFSET)
+    T_lidar_initial = _pose(8.0)
+    T_lidar_prior = _pose(9.0)
+    graph = RollingGraph(
+        streams=_pose_streams(),
+        variable_configs={
+            lidar_ext_key: VariableConfig(initial_source="numerical", initial_value=T_lidar_initial, prior_source="numerical", prior_value=T_lidar_prior, prior_information=1.0),
+            lidar_tau_key: VariableConfig(initial_source="numerical", initial_value=0.25),
+        },
+        solver_config=SolverConfig(maxIters=0),
+    )
+
+    with patch("multi_sensor_pipeline.rolling_graph.estimate_imu_calibration_numerical") as estimate, patch.object(LidarPoseStream, "add_factors", lambda self, context: None):
+        graph.build_problem(pose_timestamps=pose_timestamps, states=_poses(pose_timestamps))
+
+    assert estimate.call_count == 0
+    assert np.allclose(graph.states_init[graph.node_for(lidar_ext_key)], T_lidar_initial)
+    assert np.allclose(graph.metadata.priors[0].prior_value, T_lidar_prior)
+    assert graph.metadata.priors[0].prior_source == ValueSource.CONSTANT
+    lidar_ext_metadata = next(variable for variable in graph.metadata.calibration_variables if variable.key == lidar_ext_key)
+    assert lidar_ext_metadata.initial_source == ValueSource.CONSTANT
+    assert float(np.asarray(graph.states_init[graph.node_for(lidar_tau_key)]).reshape(-1)[0]) == 0.25
 
 
 def test_fixed_variable_and_soft_prior_are_distinct_mechanisms():

@@ -32,7 +32,7 @@ class GyroStream(MeasurementStream):
     timestamps: Sequence[float]
     angular_velocity: Any
     samples_per_factor: int | None = 64
-    time_offset_margin: float = 0.25
+    time_offset_margin: float = 1.0
     information: Any = 1.0
     factor_stride: int = 1
     stream_name: str | None = None
@@ -121,7 +121,7 @@ class SimpleAccelStream(MeasurementStream):
     timestamps: Sequence[float]
     acceleration: Any
     samples_per_factor: int | None = 64
-    time_offset_margin: float = 0.25
+    time_offset_margin: float = 1.0
     gravity_world: Sequence[float] = (0.0, 0.0, -9.81)
     information: Any = 1.0
     factor_stride: int = 1
@@ -235,7 +235,7 @@ class ComplexAccelStream(MeasurementStream):
     acceleration: Any
     angular_velocity: Any
     samples_per_factor: int | None = 64
-    time_offset_margin: float = 0.25
+    time_offset_margin: float = 1.0
     gravity_world: Sequence[float] = (0.0, 0.0, -9.81)
     information: Any = 1.0
     factor_stride: int = 1

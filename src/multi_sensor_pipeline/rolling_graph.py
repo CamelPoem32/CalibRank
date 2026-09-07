@@ -11,6 +11,7 @@ from typing import Any, Mapping, Sequence
 
 import mrob
 import numpy as np
+from tqdm import tqdm
 
 try:
     import data_processing
@@ -153,6 +154,11 @@ class _CalibrationValueResolver:
     def _resolve(self, key: VariableKey, source: ValueSource, configured_value: Any, *, role: str) -> ResolvedValue:
         # Resolve numerical values once per IMU sensor and reuse them for both initial values and soft priors.
         if source == ValueSource.NUMERICAL:
+            sensor = self.rolling_graph.sensors.get(key.sensor_id)
+            if sensor is not None and sensor.kind != "imu":
+                fallback_value, fallback_source = self._fallback_value(key, configured_value, role=role)
+                return ResolvedValue(coerce_variable_value(key, fallback_value, role=role), requested_source=source, effective_source=fallback_source)
+
             result = self._numerical_result_for_imu(key.sensor_id)
             value = self._value_from_numerical_result(key, result)
             if result.success and value is not None:
@@ -195,7 +201,7 @@ class _CalibrationValueResolver:
         if imu_data is None:
             raise ValueError(f"numerical calibration requested for {imu_sensor_id}, but no GyroStream for that sensor is available")
         if lidar_data is None:
-            raise ValueError(f"numerical calibration requested for {imu_sensor_id}, but no LidarOdometryStream is available")
+            raise ValueError(f"numerical calibration requested for {imu_sensor_id}, but no LiDAR stream exposing numerical pose data is available")
 
         # Numerical IMU calibration needs current estimates for the LiDAR extrinsic, gyro bias, and prior IMU translation. These are resolved without using numerical again to avoid source cycles.
         lidar_sensor_id = lidar_data["sensor_id"]
@@ -682,20 +688,98 @@ class RollingGraph:
         initial_values: Mapping[VariableKey, ResolvedValue],
     ) -> list[np.ndarray]:
         window_pose_timestamps = pose_timestamps[window_pose_indices]
-        rolling_states = self.rolling_state.pose_prefix(window_pose_timestamps)
-        if len(rolling_states) > 0:
-            return rolling_states
+
+        ##################################################
+        # Collect supplied states aligned with the GLOBAL
+        # pose indices.
+        #
+        # These are the caller-provided trajectory seeds,
+        # for example the absolute LiDAR map poses supplied
+        # by notebook 19.
+        ##################################################
 
         supplied_states = [] if states is None else list(states)
-        window_states = [supplied_states[index] for index in window_pose_indices if index < len(supplied_states)]
-        if len(window_states) > 0:
-            return [data_processing._as_pose_matrix(state) for state in window_states]
 
-        # If the first supplied/global state precedes this window, propagate to the first window timestamp before initializing the window itself.
+        supplied_window_states: list[np.ndarray] = []
+
+        for global_pose_index in window_pose_indices:
+            if global_pose_index >= len(supplied_states):
+                break
+
+            supplied_window_states.append(
+                data_processing._as_pose_matrix(
+                    supplied_states[global_pose_index]
+                )
+            )
+
+        ##################################################
+        # Retrieve the already-optimized consecutive prefix
+        # from previous rolling windows.
+        ##################################################
+
+        rolling_states = self.rolling_state.pose_prefix(
+            window_pose_timestamps
+        )
+
+        rolling_states = [
+            data_processing._as_pose_matrix(state)
+            for state in rolling_states
+        ]
+
+        ##################################################
+        # Merge both sources.
+        #
+        # Priority:
+        #
+        # 1. optimized rolling state, where available;
+        # 2. caller-supplied state for the unseen suffix;
+        # 3. propagation only for poses for which neither
+        #    source has a value.
+        ##################################################
+
+        merged_length = max(
+            len(rolling_states),
+            len(supplied_window_states),
+        )
+
+        window_states: list[np.ndarray] = []
+
+        for local_pose_index in range(merged_length):
+            if local_pose_index < len(rolling_states):
+                window_states.append(
+                    rolling_states[local_pose_index]
+                )
+            elif local_pose_index < len(supplied_window_states):
+                window_states.append(
+                    supplied_window_states[local_pose_index]
+                )
+            else:
+                break
+
+        if len(window_states) > 0:
+            return window_states
+
+        ##################################################
+        # Fallback only when neither rolling nor supplied
+        # initialization reaches this window.
+        ##################################################
+
         first_window_index = int(window_pose_indices[0])
-        prefix_timestamps = pose_timestamps[: first_window_index + 1]
-        prefix_poses = self._initialize_trajectory_poses_from_values(prefix_timestamps, states=supplied_states, first_pose=first_pose, initial_values=initial_values)
-        return [prefix_poses[-1]]
+
+        prefix_timestamps = pose_timestamps[
+            : first_window_index + 1
+        ]
+
+        prefix_poses = self._initialize_trajectory_poses_from_values(
+            prefix_timestamps,
+            states=supplied_states,
+            first_pose=first_pose,
+            initial_values=initial_values,
+        )
+
+        return [
+            prefix_poses[-1]
+        ]
 
     def generate_filter_window(
         self,
@@ -865,9 +949,9 @@ class RollingGraph:
         # Build, optimize, and commit every window
         ##################################################
 
-        for window_index, current_window_start in enumerate(
-            window_starts
-        ):
+        enumerator = enumerate(window_starts)
+        if verbose > -1: enumerator = enumerate(tqdm(window_starts))
+        for window_index, current_window_start in enumerator:
             current_window_end = min(
                 current_window_start + float(window_size),
                 required_end,
