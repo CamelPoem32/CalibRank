@@ -8,6 +8,11 @@ import pickle
 from pathlib import Path
 import sys
 
+import matplotlib
+
+# The renderer is a headless worker, including when launched from a GUI notebook.
+matplotlib.use("Agg")
+
 
 def main(argv: list[str] | None = None) -> int:
     """Load a dashboard payload and render the MP4 in this process.
@@ -48,7 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         **render_kwargs,
     )
 
-    print(f"Saved MP4 in subprocess: {output_mp4}")
+    if render_kwargs.get("verbose", 1):
+        print(f"Saved MP4 in subprocess: {output_mp4}", flush=True)
     return 0
 
 

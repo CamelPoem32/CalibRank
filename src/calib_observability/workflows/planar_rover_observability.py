@@ -1108,6 +1108,7 @@ def plot_rover_dataset_overview(
 run_rolling_observability_analysis = partial(
     build_observability_visualization_series,
     display_variables=SUPPORTED_CALIBRATION_VARIABLES,
+    verbose=True,
 )
 
 
@@ -1438,6 +1439,7 @@ def save_simple_accelerometer_dashboard(
     *,
     window_duration: float,
     window_step: float,
+    max_analysis_windows: int | None = None,
     accelerometer_options: AccelerometerOptions,
     fixed_extrinsic: FixedExtrinsic = "T_B_L",
     practical_rank_policy: PracticalRankPolicy = DEFAULT_PRACTICAL_RANK_POLICY,
@@ -1465,6 +1467,8 @@ def save_simple_accelerometer_dashboard(
     standalone_html: bool = True,
     standalone_html_max_frames: int = 2000,
     save_html=True,
+    verbose=True,
+    n_processes: int = 1,
 ) -> tuple[ObservabilityVisualizationSeries, Path]:
     '''Run simple-accelerometer diagnostics and save the live dashboard.
 
@@ -1476,6 +1480,9 @@ def save_simple_accelerometer_dashboard(
         output_html: Destination HTML animation path.
         window_duration: Rolling-window duration in seconds.
         window_step: Time step between dashboard snapshots.
+        max_analysis_windows: Optional snapshot cap before analysis and storage.
+        verbose: Show analysis-window progress and MP4 renderer output.
+        n_processes: Number of analysis processes; one executes sequentially.
         accelerometer_options: Accelerometer configuration with mode ``simple``.
         fixed_extrinsic: Body-frame convention.
         practical_rank_policy: Practical-rank threshold policy.
@@ -1510,11 +1517,12 @@ def save_simple_accelerometer_dashboard(
         raise ValueError("save_simple_accelerometer_dashboard expects AccelerometerOptions(mode='simple')")
 
     simple_series = build_observability_visualization_series(
-        dataset, pose_provider, window_duration=window_duration, window_step=window_step, fixed_extrinsic=fixed_extrinsic,
+        dataset, pose_provider, window_duration=window_duration, window_step=window_step, max_analysis_windows=max_analysis_windows, fixed_extrinsic=fixed_extrinsic,
         practical_rank_policy=practical_rank_policy, parameter_scales=parameter_scales, tau_target_std_seconds=tau_target_std_seconds,
         jacobian_options=jacobian_options, accelerometer_options=accelerometer_options, use_sparse=use_sparse, display_variables=display_variables,
         normalization=normalization, max_display_rows=max_display_rows, max_display_cols=max_display_cols, lidar_rate_hz=lidar_rate_hz,
-        coordinate_null_fraction_tolerance=coordinate_null_fraction_tolerance, show_local_accuracy_summary=True,
+        coordinate_null_fraction_tolerance=coordinate_null_fraction_tolerance, show_local_accuracy_summary=True, verbose=verbose,
+        n_processes=n_processes,
     )
 
     rendered_snapshots = simple_series.snapshots[::downsample]
@@ -1537,13 +1545,14 @@ def save_simple_accelerometer_dashboard(
             dataset, rendered_snapshots, html_output_path, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
             show_local_accuracy_summary=True, output_mp4=None, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
             html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
-            save_html=True,)
+            save_html=True, verbose=verbose,)
     else:
         animation_path = requested_mp4_path if requested_mp4_path is not None else html_output_path
 
     if requested_mp4_path is not None:
         mp4_path = save_quasi_realtime_rover_animation_mp4_subprocess(
             dataset, rendered_snapshots, requested_mp4_path, display_variables=display_variables, trajectory_samples=trajectory_samples, interval_ms=interval_ms,
+            verbose=verbose,
             show_local_accuracy_summary=True, mp4_fps=mp4_fps, mp4_dpi=mp4_dpi, max_rendered_frames=max_rendered_frames,
             html_dpi=html_dpi, html_frame_format=html_frame_format, embed_limit_mb=embed_limit_mb, figsize=figsize, standalone_html=standalone_html, standalone_html_max_frames=standalone_html_max_frames,
         )

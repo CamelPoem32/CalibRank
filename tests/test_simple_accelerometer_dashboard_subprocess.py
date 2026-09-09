@@ -14,6 +14,8 @@ def test_simple_accelerometer_dashboard_mp4_primary_path_uses_subprocess(monkeyp
     snapshots = [SimpleNamespace(current_time=0.0)]
 
     def fake_series(*args, **kwargs):
+        assert kwargs["n_processes"] == 3
+        assert kwargs["verbose"] == 2
         return SimpleNamespace(snapshots=snapshots)
 
     def fake_html(*args, **kwargs):
@@ -34,6 +36,8 @@ def test_simple_accelerometer_dashboard_mp4_primary_path_uses_subprocess(monkeyp
         output_html=tmp_path / "dashboard.mp4",
         window_duration=5.0,
         window_step=1.0,
+        n_processes=3,
+        verbose=2,
         accelerometer_options=AccelerometerOptions(mode="simple"),
         max_display_rows=2,
         max_display_cols=2,

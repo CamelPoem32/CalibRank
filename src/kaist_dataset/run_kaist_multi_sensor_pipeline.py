@@ -576,19 +576,22 @@ def kaist_dataset_layout(dataset_root: Path) -> tuple[str, Path, Path]:
     return dataset_name, sensor_data_root, reference_pose_path
 
 
-def processed_data_directory_has_required_files(path: Path, lidar_mode: str) -> bool:
-    '''Return whether a directory contains the left-LiDAR CSV required by the selected LiDAR mode.'''
+def processed_data_directory_has_required_files(path: Path, lidar_mode: str, lidar_side: str = 'left') -> bool:
+    '''Return whether a directory contains the selected LiDAR CSV.'''
+
+    if lidar_side not in ('left', 'right'):
+        raise ValueError(f'Unknown LiDAR side: {lidar_side}')
 
     if lidar_mode == 'poses':
-        return (path / 'lidar_map_poses_vlp_left.csv').is_file()
+        return (path / f'lidar_map_poses_vlp_{lidar_side}.csv').is_file()
 
     if lidar_mode == 'odometry':
-        return (path / 'lidar_odometry_vlp_left.csv').is_file()
+        return (path / f'lidar_odometry_vlp_{lidar_side}.csv').is_file()
 
     raise ValueError(f'Unknown LiDAR mode: {lidar_mode}')
 
 
-def resolve_processed_data_directory(dataset_root: Path, dataset_name: str, requested_path: Path | None, lidar_mode: str) -> Path:
+def resolve_processed_data_directory(dataset_root: Path, dataset_name: str, requested_path: Path | None, lidar_mode: str, lidar_side: str = 'left') -> Path:
     '''Resolve the directory containing the LiDAR CSV required by the selected LiDAR mode.'''
 
     if requested_path is not None:
@@ -602,8 +605,8 @@ def resolve_processed_data_directory(dataset_root: Path, dataset_name: str, requ
         if not processed_data_dir.is_dir():
             raise FileNotFoundError(f'Processed-data directory does not exist: {processed_data_dir}')
 
-        if not processed_data_directory_has_required_files(processed_data_dir, lidar_mode):
-            required_filename = 'lidar_map_poses_vlp_left.csv' if lidar_mode == 'poses' else 'lidar_odometry_vlp_left.csv'
+        if not processed_data_directory_has_required_files(processed_data_dir, lidar_mode, lidar_side):
+            required_filename = f'lidar_map_poses_vlp_{lidar_side}.csv' if lidar_mode == 'poses' else f'lidar_odometry_vlp_{lidar_side}.csv'
             raise FileNotFoundError(f'Processed-data directory does not contain the file required by LiDAR mode "{lidar_mode}":\n  {required_filename}\nDirectory: {processed_data_dir}')
 
         return processed_data_dir
@@ -611,11 +614,11 @@ def resolve_processed_data_directory(dataset_root: Path, dataset_name: str, requ
     candidates = [dataset_root, dataset_root / 'data', PROJECT_ROOT / 'data' / 'KAISTDataset' / dataset_name]
 
     for candidate in candidates:
-        if processed_data_directory_has_required_files(candidate, lidar_mode):
+        if processed_data_directory_has_required_files(candidate, lidar_mode, lidar_side):
             return candidate.resolve()
 
     candidate_text = '\n'.join(f'  {candidate}' for candidate in candidates)
-    required_filename = 'lidar_map_poses_vlp_left.csv' if lidar_mode == 'poses' else 'lidar_odometry_vlp_left.csv'
+    required_filename = f'lidar_map_poses_vlp_{lidar_side}.csv' if lidar_mode == 'poses' else f'lidar_odometry_vlp_{lidar_side}.csv'
 
     raise FileNotFoundError(f'Could not find processed LiDAR data for mode "{lidar_mode}".\nRequired file:\n  {required_filename}\nSearched:\n{candidate_text}\nPass its directory explicitly using --processed-data-dir.')
 

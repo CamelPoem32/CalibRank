@@ -18,6 +18,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib import animation
 import gc
+from tqdm import tqdm
 
 
 from ..assembly import JacobianBundle
@@ -75,6 +76,9 @@ class QuasiRealtimeConfig:
     Attributes:
         window_length (float): Duration of the active analysis window in seconds.
         frame_step (float): Time increment between consecutive snapshots.
+        max_analysis_windows: Optional uniformly distributed snapshot budget,
+            applied before any Jacobian assembly. None keeps the full schedule.
+        n_processes: Number of analysis worker processes; one runs sequentially.
         use_sparse (bool): Whether to assemble and project sparse Jacobians.
         relative_rank_threshold (float): Relative threshold retained for legacy
             rank displays.
@@ -122,6 +126,8 @@ class QuasiRealtimeConfig:
     show_local_accuracy_summary: bool = True
     accelerometer_options: AccelerometerOptions | None = None
     normalize_J_C_factor_blocks_for_display: bool = True
+    max_analysis_windows: int | None = None
+    n_processes: int = 1
 
 
 @dataclass(frozen=True)
@@ -384,10 +390,75 @@ def matrix_for_display(
     return np.nan_to_num(display_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def analysis_frame_times(start: float, end: float, step: float, maximum: int | None = None) -> NDArray[np.float64]:
+    '''Choose bounded analysis times without allocating the full uncapped grid.
+
+    Args:
+        start: First reference timestamp in seconds.
+        end: Last reference timestamp in seconds, included exactly.
+        step: Requested snapshot spacing in seconds.
+        maximum: Optional positive cap; one selects only the final timestamp.
+
+    Returns:
+        Increasing timestamps within the dataset bounds, shape ``(N,)``.
+    '''
+    if not np.isfinite([start, end, step]).all() or step <= 0 or end < start:
+        raise ValueError('Require finite start <= end and positive step')
+    if maximum is not None and (int(maximum) != maximum or maximum < 1):
+        raise ValueError('max_analysis_windows must be a positive integer')
+
+    # Select integer grid indices first, so long sequences cannot allocate an
+    # unbounded timeline merely to discard most of it afterward.
+    count = int(np.ceil((end - start) / step)) + 1
+    indices = _animation_frame_indices(count, maximum)
+    return np.minimum(start + indices * step, end)
+
+
+_SNAPSHOT_WORKER_INPUTS = None
+
+
+def _initialize_snapshot_worker(payload: bytes) -> None:
+    """Load shared analysis inputs once inside each spawned worker.
+
+    Args:
+        payload: Cloudpickled dataset, pose provider and runtime configuration.
+
+    Returns:
+        None. Inputs remain local to this process for subsequent window tasks.
+    """
+    import cloudpickle
+
+    global _SNAPSHOT_WORKER_INPUTS
+    _SNAPSHOT_WORKER_INPUTS = cloudpickle.loads(payload)
+
+
+def _compute_snapshot_worker(current_time: float) -> bytes:
+    """Analyze one timestamp with the worker-local inputs.
+
+    Args:
+        current_time: Window endpoint in reference-clock seconds.
+
+    Returns:
+        Cloudpickled complete snapshot, including full diagnostic objects.
+    """
+    import cloudpickle
+
+    dataset, pose_provider, config = _SNAPSHOT_WORKER_INPUTS
+    start, end = rolling_window_bounds(current_time, float(dataset.start_time), config.window_length)
+    snapshot = build_window_snapshot(
+        dataset, pose_provider, current_time=current_time,
+        window_start=start, window_end=end, config=config,
+    )
+    # Factor metadata and simulated trajectories can contain local functions;
+    # preserve the full snapshot rather than stripping it to display-only data.
+    return cloudpickle.dumps(snapshot)
+
+
 def compute_quasi_realtime_snapshots(
     dataset: object,
     pose_provider: object,
     config: QuasiRealtimeConfig | None = None,
+    verbose=False,
 ) -> list[QuasiRealtimeSnapshot]:
     '''Compute growing-prefix and rolling-window snapshots.
 
@@ -397,6 +468,7 @@ def compute_quasi_realtime_snapshots(
         pose_provider (object): Continuous provider used by dataset assembly.
         config (QuasiRealtimeConfig | None): Runtime configuration. Defaults are
             used when omitted.
+        verbose: Show a single progress bar counting completed analysis windows.
 
     Returns:
         list[QuasiRealtimeSnapshot]: Snapshots ordered by current time.
@@ -406,20 +478,51 @@ def compute_quasi_realtime_snapshots(
     '''
 
     runtime_config = QuasiRealtimeConfig() if config is None else config
+    n_processes = runtime_config.n_processes
+    if not isinstance(n_processes, int) or isinstance(n_processes, bool) or n_processes < 1:
+        raise ValueError("n_processes must be a positive integer")
     if runtime_config.frame_step <= 0.0:
         raise ValueError("frame_step must be positive")
     dataset_start_time = float(getattr(dataset, "start_time"))
     dataset_end_time = float(getattr(dataset, "end_time"))
-    frame_times = np.arange(
-        dataset_start_time,
-        dataset_end_time + 0.5 * runtime_config.frame_step,
-        runtime_config.frame_step,
+    frame_times = analysis_frame_times(
+        dataset_start_time, dataset_end_time, runtime_config.frame_step,
+        runtime_config.max_analysis_windows,
     )
-    if frame_times.size == 0 or frame_times[-1] < dataset_end_time:
-        frame_times = np.r_[frame_times, dataset_end_time]
 
+    # Completion order may differ from timestamp order. Count every completed
+    # window in the parent and restore input order before returning snapshots.
+    if n_processes > 1:
+        import cloudpickle
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        payload = cloudpickle.dumps((dataset, pose_provider, runtime_config))
+        results = []
+        with ProcessPoolExecutor(
+            max_workers=min(n_processes, len(frame_times)),
+            mp_context=mp.get_context("spawn"),
+            initializer=_initialize_snapshot_worker, initargs=(payload,),
+        ) as executor:
+            pending = {executor.submit(_compute_snapshot_worker, float(time)): index
+                       for index, time in enumerate(frame_times)}
+            with tqdm(total=len(frame_times), desc="Analysis windows", unit="window",
+                      disable=not verbose) as progress:
+                try:
+                    for future in as_completed(pending):
+                        index = pending.pop(future)
+                        results.append((index, cloudpickle.loads(future.result())))
+                        progress.update(1)
+                except BaseException:
+                    for future in pending:
+                        future.cancel()
+                    raise
+        results.sort(key=lambda result: result[0])
+        return [snapshot for _, snapshot in results]
+
+    # Preserve the serial path for debugging and for callers needing no pool.
     snapshots: list[QuasiRealtimeSnapshot] = []
-    for current_time in frame_times:
+    for current_time in tqdm(frame_times, desc="Analysis windows", unit="window", disable=not verbose):
         window_start, window_end = rolling_window_bounds(
             float(current_time),
             dataset_start_time,
@@ -862,6 +965,7 @@ def build_observability_visualization_series(
     *,
     window_duration: float,
     window_step: float,
+    max_analysis_windows: int | None = None,
     fixed_extrinsic: FixedExtrinsic = "T_B_L",
     practical_rank_policy: PracticalRankPolicy = DEFAULT_PRACTICAL_RANK_POLICY,
     parameter_scales: ParameterScales = ParameterScales(),
@@ -876,6 +980,8 @@ def build_observability_visualization_series(
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
     show_local_accuracy_summary: bool = True,
+    verbose=False,
+    n_processes: int = 1,
 ) -> ObservabilityVisualizationSeries:
     '''Build canonical visualization arrays for notebooks 04 and 07.
 
@@ -884,6 +990,7 @@ def build_observability_visualization_series(
         pose_provider (object): Continuous pose and twist provider.
         window_duration (float): Rolling-window duration in seconds.
         window_step (float): Time step between snapshots.
+        max_analysis_windows: Optional cap applied before computing snapshots.
         fixed_extrinsic (FixedExtrinsic): Fixed body-frame convention.
         practical_rank_policy (PracticalRankPolicy): Canonical rank thresholds.
         parameter_scales (ParameterScales): Physical parameter scales.
@@ -899,6 +1006,8 @@ def build_observability_visualization_series(
         lidar_rate_hz (float | None): Optional rate for frame-unit timing bounds.
         coordinate_null_fraction_tolerance (float): Bounded-coordinate tolerance.
         show_local_accuracy_summary (bool): Dashboard local-accuracy flag.
+        verbose: Show progress over completed analysis windows.
+        n_processes: Analysis worker count; one keeps serial execution.
 
     Returns:
         ObservabilityVisualizationSeries: Canonical snapshots and aligned arrays.
@@ -911,6 +1020,8 @@ def build_observability_visualization_series(
     config = QuasiRealtimeConfig(
         window_length=window_duration,
         frame_step=window_step,
+        max_analysis_windows=max_analysis_windows,
+        n_processes=n_processes,
         use_sparse=use_sparse,
         normalization=normalization,
         display_variables=display_variables,
@@ -926,7 +1037,7 @@ def build_observability_visualization_series(
         coordinate_null_fraction_tolerance=coordinate_null_fraction_tolerance,
         show_local_accuracy_summary=show_local_accuracy_summary,
     )
-    snapshots = compute_quasi_realtime_snapshots(dataset, pose_provider, config)
+    snapshots = compute_quasi_realtime_snapshots(dataset, pose_provider, config, verbose=verbose)
     series = dashboard_series(snapshots, display_variables)
     C_X_L_rank = np.asarray([
         snapshot.motion_lidar.practical_rank if snapshot.motion_lidar is not None else np.nan
@@ -1054,6 +1165,7 @@ def save_quasi_realtime_rover_animation(
     *,
     display_variables: tuple[str, ...] = ("T_B_I", "b_g", "tau_I", "tau_L"),
     trajectory_samples: int = 600,
+    reference_trajectory: object | None = None,
     interval_ms: int = 250,
     figsize=(17, 10),
     show_local_accuracy_summary: bool = True,
@@ -1067,6 +1179,7 @@ def save_quasi_realtime_rover_animation(
     standalone_html: bool = False,
     standalone_html_max_frames: int = 300,
     save_html=True,
+    verbose: int = 1,
 ) -> Path:
     '''Save a standalone HTML animation and optionally an MP4 companion.
 
@@ -1078,6 +1191,8 @@ def save_quasi_realtime_rover_animation(
         output_html: Destination standalone HTML file.
         display_variables: Variables shown in dashboard text and condition plots.
         trajectory_samples: Number of samples used to draw the complete path.
+        reference_trajectory: Optional comparison trajectory in the same frame.
+        verbose: MP4 logging level: 0 silences status and progress; 1 or 2 enables them.
         interval_ms: Playback delay between rendered frames in milliseconds. This controls playback speed, not rendering cost per frame.
         figsize: Matplotlib figure size in inches.
         show_local_accuracy_summary: Whether dashboard text includes coordinate-accuracy details.
@@ -1129,6 +1244,10 @@ def save_quasi_realtime_rover_animation(
     trajectory = getattr(dataset, "trajectory")
     sample_times, sampled_positions, _ = trajectory.sample(int(trajectory_samples))
     positions_xy = sampled_positions[:, :2]
+    reference_xy = None
+    if reference_trajectory is not None:
+        _, reference_positions, _ = reference_trajectory.sample(int(trajectory_samples))
+        reference_xy = reference_positions[:, :2]
     frame_times = np.asarray([snapshot.current_time for snapshot in rendered_snapshots], dtype=float)
     condition_variables = _condition_plot_variables(display_variables)
     condition_series = dashboard_series(rendered_snapshots, display_variables)["condition_numbers"]
@@ -1161,14 +1280,16 @@ def save_quasi_realtime_rover_animation(
     ##################################################
 
     fig = plt.figure(figsize=figsize, dpi=int(html_dpi))
-    grid = fig.add_gridspec(2, 4, width_ratios=[1.35, 1.35, 1.0, 1.0], height_ratios=[1.0, 1.0])
+    grid = fig.add_gridspec(2, 5, width_ratios=[1.2, 1.2, 2.0, 1.0, 1.0], height_ratios=[1.0, 1.0], wspace=0.5)
     trajectory_axis = fig.add_subplot(grid[:, :2])
-    rank_axis = fig.add_subplot(grid[0, 2])
-    condition_axis = fig.add_subplot(grid[0, 3])
-    jacobian_axis = fig.add_subplot(grid[1, 2])
-    motion_axis = fig.add_subplot(grid[1, 3])
-
+    rank_axis = fig.add_subplot(grid[:, 2])
+    condition_axis = fig.add_subplot(grid[0, 3:])
+    jacobian_axis = fig.add_subplot(grid[1, 3])
+    motion_axis = fig.add_subplot(grid[1, 4])
+    # Plot both paths in the same translated world and fixed-sensor body frame.
     trajectory_axis.plot(positions_xy[:, 0], positions_xy[:, 1], color="0.78", linewidth=2.0, label="full path")
+    if reference_xy is not None:
+        trajectory_axis.plot(reference_xy[:, 0], reference_xy[:, 1], color="#2ca02c", linestyle="--", linewidth=1.4, label="KAIST ground truth")
     traversed_line, = trajectory_axis.plot([], [], color="#1f77b4", linewidth=2.5, label="traversed")
     window_line, = trajectory_axis.plot([], [], color="#d62728", linewidth=4.0, alpha=0.35, label="active window")
     rover_marker, = trajectory_axis.plot([], [], marker="o", color="#111111", markersize=8)
@@ -1179,10 +1300,29 @@ def save_quasi_realtime_rover_animation(
     trajectory_axis.set_ylabel("y [m]")
     trajectory_axis.grid(True, alpha=0.3)
     trajectory_axis.legend(loc="upper right")
-    _pad_axis_limits(trajectory_axis, positions_xy)
+    _pad_axis_limits(trajectory_axis, positions_xy if reference_xy is None else np.vstack((positions_xy, reference_xy)))
 
     rank_axis.axis("off")
     rank_text = rank_axis.text(0.0, 1.0, "", va="top", ha="left", family="monospace", fontsize=9)
+
+    # Wrap and fit every frame before rendering; one stable font size keeps
+    # long uncertainty summaries inside their dedicated full-height column.
+    import textwrap
+    rank_texts = ["\n".join(
+        textwrap.fill(line, width=58, subsequent_indent="  ", replace_whitespace=False)
+        for line in text.splitlines()
+    ) for text in rank_texts]
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    available = rank_axis.get_window_extent(renderer)
+    largest_width = largest_height = 1.0
+    for text in rank_texts:
+        rank_text.set_text(text)
+        bounds = rank_text.get_window_extent(renderer)
+        largest_width = max(largest_width, bounds.width)
+        largest_height = max(largest_height, bounds.height)
+    rank_text.set_fontsize(9 * min(1.0, 0.96 * available.width / largest_width, 0.96 * available.height / largest_height))
+    rank_text.set_text("")
 
     condition_lines = {}
     for variable_name in condition_variables:
@@ -1241,6 +1381,7 @@ def save_quasi_realtime_rover_animation(
         )
         _update_separator_lines(jacobian_horizontal_lines, jacobian_vertical_lines, snapshot.J_C_display_layout)
         _update_layout_ticks(jacobian_axis, snapshot.J_C_display_layout, x_fontsize=6, y_fontsize=6)
+        jacobian_axis.tick_params(axis="x", labelrotation=60)
         jacobian_axis.set_title(_j_c_display_title(snapshot))
 
         motion_matrix = motion_matrices[frame_index]
@@ -1270,7 +1411,7 @@ def save_quasi_realtime_rover_animation(
 
     figure_animation = animation.FuncAnimation(fig, update, frames=len(rendered_snapshots), interval=interval_ms, blit=False, cache_frame_data=False)
 
-        ##################################################
+    ##################################################
     # Render HTML and optional MP4
     ##################################################
 
@@ -1296,23 +1437,26 @@ def save_quasi_realtime_rover_animation(
             mp4_path = Path(output_mp4)
             mp4_path.parent.mkdir(parents=True, exist_ok=True)
 
-            print(
-                f"Starting MP4 rendering: "
-                f"{len(rendered_snapshots)} frames",
-                flush=True,
-            )
+            if verbose:
+                print(f"Starting MP4 rendering: {len(rendered_snapshots)} frames", flush=True)
 
             writer = animation.FFMpegWriter(
                 fps=frames_per_second,
                 metadata={"artist": "calib_observability"},
             )
-            figure_animation.save(
-                str(mp4_path),
-                writer=writer,
-                dpi=int(mp4_dpi),
-            )
+            
 
-            print(f"Saved MP4: {mp4_path}", flush=True)
+            # Matplotlib calls this once per saved frame. Use the index rather
+            # than the animation update hook, which can run repeatedly at startup.
+            with tqdm(total=len(rendered_snapshots), desc="Rendering MP4", unit="frame",
+                      disable=not verbose) as progress:
+                figure_animation.save(
+                    str(mp4_path), writer=writer, dpi=int(mp4_dpi),
+                    progress_callback=lambda index, total: progress.update(index + 1 - progress.n),
+                )
+
+            if verbose:
+                print(f"Saved MP4: {mp4_path}", flush=True)
             gc.collect()
 
         ##################################################
@@ -2291,6 +2435,50 @@ def _pickleable_trajectory_proxy(
     )
 
 
+def _run_renderer_subprocess(command: list[str], *, verbose: int) -> None:
+    """Stream child output live while retaining bounded failure diagnostics.
+
+    Args:
+        command: Renderer executable and argument list.
+        verbose: Zero captures output silently; positive levels echo it live.
+
+    Returns:
+        None after the child exits successfully.
+
+    Raises:
+        subprocess.CalledProcessError: Child failed; output contains its recent log.
+    """
+    import codecs
+    from collections import deque
+    import subprocess
+    import sys
+
+    # Read both streams together to avoid deadlock, preserving tqdm carriage
+    # returns without waiting for newline-terminated or process-complete output.
+    recent_output = deque(maxlen=128)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) as child:
+        try:
+            while chunk := child.stdout.read1(4096):
+                text = decoder.decode(chunk)
+                recent_output.append(text)
+                if verbose:
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+            tail = decoder.decode(b"", final=True)
+            recent_output.append(tail)
+            if verbose and tail:
+                sys.stderr.write(tail)
+                sys.stderr.flush()
+            returncode = child.wait()
+        except BaseException:
+            child.kill()
+            child.wait()
+            raise
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command, output="".join(recent_output))
+
+
 def save_quasi_realtime_rover_animation_mp4_subprocess(
     dataset: object,
     snapshots: list[QuasiRealtimeSnapshot],
@@ -2298,6 +2486,7 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
     *,
     display_variables: tuple[str, ...] = ("T_B_I", "b_g", "tau_I", "tau_L"),
     trajectory_samples: int = 600,
+    reference_trajectory: object | None = None,
     interval_ms: int = 250,
     figsize=(17, 10),
     show_local_accuracy_summary: bool = True,
@@ -2310,6 +2499,7 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
     standalone_html: bool = False,
     standalone_html_max_frames: int = 300,
     keep_payload: bool = False,
+    verbose: int = 1,
 ) -> Path:
     """Render a quasi-realtime dashboard MP4 in a child Python process.
 
@@ -2321,6 +2511,8 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
         display_variables: Calibration variables shown in dashboard text and
             condition plots.
         trajectory_samples: Number of trajectory samples for the path display.
+        reference_trajectory: Optional comparison trajectory in the same frame;
+            serialized as bounded NumPy arrays, never as a callable closure.
         interval_ms: Animation playback delay in milliseconds.
         figsize: Matplotlib figure size in inches.
         show_local_accuracy_summary: Whether rank text includes local accuracy.
@@ -2334,6 +2526,7 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
         standalone_html: Retained for API symmetry with HTML rendering.
         standalone_html_max_frames: Retained for API symmetry with HTML rendering.
         keep_payload: If true, keep the temporary pickle payload beside the MP4.
+        verbose: Zero suppresses child status/progress output; positive levels stream it live.
 
     Returns:
         Resolved MP4 path.
@@ -2353,7 +2546,10 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
     if not script_path.exists():
         raise FileNotFoundError(f"MP4 subprocess renderer is missing: {script_path}")
 
-    pickleable_snapshots = [_pickleable_snapshot_for_animation(snapshot) for snapshot in snapshots]
+    # Bound the payload and proxy support before serialization, not just the
+    # number of frames eventually rendered by the child process.
+    frame_indices = _animation_frame_indices(len(snapshots), max_rendered_frames)
+    pickleable_snapshots = [_pickleable_snapshot_for_animation(snapshots[int(index)]) for index in frame_indices]
     frame_times = np.asarray([snapshot.current_time for snapshot in pickleable_snapshots], dtype=float)
     trajectory_proxy = _pickleable_trajectory_proxy(
         getattr(dataset, "trajectory"),
@@ -2365,6 +2561,10 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
         "dataset": SimpleNamespace(trajectory=trajectory_proxy),
         "snapshots": pickleable_snapshots,
         "render_kwargs": {
+            "verbose": verbose,
+            "reference_trajectory": None if reference_trajectory is None else _pickleable_trajectory_proxy(
+                reference_trajectory, trajectory_samples=trajectory_samples, frame_times=frame_times,
+            ),
             "display_variables": display_variables,
             "trajectory_samples": trajectory_samples,
             "interval_ms": interval_ms,
@@ -2386,6 +2586,7 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
 
     command = [
         sys.executable,
+        "-u",
         str(script_path),
         "--payload",
         str(payload_path),
@@ -2394,17 +2595,8 @@ def save_quasi_realtime_rover_animation_mp4_subprocess(
     ]
     succeeded = False
     try:
-        completed = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        _run_renderer_subprocess(command, verbose=verbose)
         succeeded = True
-        if completed.stdout:
-            print(completed.stdout.strip(), flush=True)
-        if completed.stderr:
-            print(completed.stderr.strip(), flush=True)
     except subprocess.CalledProcessError as exc:
         message = [
             "Quasi-realtime dashboard MP4 subprocess failed.",
