@@ -37,6 +37,17 @@ Default output layout:
                 benchmark_errors.png
                 calibration_errors.png
 
+        errors/
+            <lidar_mode>/
+                with_calibration/
+                    trajectory_errors.pkl
+                    trajectory.csv
+                    calibration_variables.pkl
+                without_calibration/
+                    trajectory_errors.pkl
+                    trajectory.csv
+                    calibration_variables.pkl
+
 Examples:
 
     python run_kaist_multi_sensor_pipeline.py /mnt/d/Downloads/MobRobLab/KAISTDataset/Urban16 --mode with-calibration
@@ -184,14 +195,6 @@ TAU_L_INITIAL_FOR_DATASET = 0.0
 
 
 ##################################################
-# Default information matrices
-##################################################
-
-
-DEFAULT_T_B_I_PRIOR_INFORMATION_DIAG = np.array([1e1, 1e1, 1e1, 1e3, 1e3, 1e3], dtype=float)
-
-
-##################################################
 # Generic helpers
 ##################################################
 
@@ -272,6 +275,7 @@ def save_figure(figure: plt.Figure, path: Path, dpi: int) -> None:
     figure.savefig(path, dpi=dpi, bbox_inches='tight')
     plt.close(figure)
 
+
 def compute_trajectory_error_series(estimated_timestamps: np.ndarray, estimated_poses: np.ndarray, reference_timestamps: np.ndarray, reference_poses: np.ndarray) -> dict[str, np.ndarray]:
     '''Calculate the raw trajectory error series saved for cross-sequence analysis.
 
@@ -317,6 +321,8 @@ def compute_trajectory_error_series(estimated_timestamps: np.ndarray, estimated_
     return {
         'timestamps_s': error_timestamps,
         'relative_timestamps_s': error_timestamps - error_timestamps[0],
+        'estimated_poses': error_estimated_poses,
+        'reference_poses': interpolated_reference_poses,
         'full_se3': full_se3_errors,
         'rotation_deg': rotational_errors_deg,
         'translation_m': translational_errors_m,
@@ -347,6 +353,138 @@ def save_trajectory_error_pickle(path: Path, *, dataset_name: str, mode: str, li
 
     with path.open('wb') as stream:
         pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return path
+
+def calibration_value_copy(value: Any) -> Any:
+    '''Return one calibration value in a pickle-friendly NumPy/scalar representation.'''
+
+    if value is None:
+        return None
+
+    array = np.asarray(value, dtype=float)
+
+    if array.ndim == 0:
+        return float(array)
+
+    return array.copy()
+
+
+def save_calibration_variables_pickle(
+    path: Path,
+    *,
+    dataset_name: str,
+    mode: str,
+    lidar_mode: str,
+    results: list[Any],
+    calibration_keys: list[VariableKey],
+    reference_values: dict[VariableKey, Any],
+    variable_configs: dict[VariableKey, VariableConfig],
+    run_config: dict[str, Any],
+) -> Path:
+    '''Save estimated and reference calibration variables for every rolling window.
+
+    The output intentionally uses string labels instead of VariableKey objects so
+    it can be inspected without reconstructing the pipeline variable classes.
+
+    Each rolling-window entry stores:
+
+        window index
+        start / end / midpoint timestamp
+        estimated calibration value
+        reference calibration value
+        variable type
+        sensor id
+        whether the variable was fixed during optimization
+    '''
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    ##################################################
+    # Describe the calibration variables once
+    ##################################################
+
+    variables = {}
+
+    for key in calibration_keys:
+        config = variable_configs.get(key)
+
+        variables[key.label] = {
+            'sensor_id': key.sensor_id,
+            'variable_type': key.variable_type.value,
+            'fixed': bool(config.fixed) if config is not None else None,
+            'reference': calibration_value_copy(reference_values.get(key)),
+        }
+
+    ##################################################
+    # Save one estimated calibration state per window
+    ##################################################
+
+    windows = []
+
+    for result in results:
+        window_variables = {}
+
+        for key in calibration_keys:
+            estimated_value = result.calibration_value(key)
+
+            window_variables[key.label] = {
+                'estimated': calibration_value_copy(estimated_value),
+                'reference': calibration_value_copy(reference_values.get(key)),
+            }
+
+        windows.append({
+            'window_index': int(result.window_index),
+            'window_start_s': float(result.window_start),
+            'window_end_s': float(result.window_end),
+            'window_midpoint_s': 0.5 * (float(result.window_start) + float(result.window_end)),
+            'variables': window_variables,
+        })
+
+    ##################################################
+    # Build a self-contained calibration-history payload
+    ##################################################
+
+    payload = {
+        'schema_version': 1,
+        'dataset_name': dataset_name,
+        'mode': mode,
+        'lidar_mode': lidar_mode,
+        'variables': variables,
+        'windows': windows,
+        'run_config': run_config,
+    }
+
+    with path.open('wb') as stream:
+        pickle.dump(
+            payload,
+            stream,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    return path
+
+
+def save_trajectory_csv(path: Path, error_series: dict[str, np.ndarray]) -> Path:
+    '''Save aligned estimated/reference trajectories as timestamped 4x4 SE(3) matrices.'''
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    timestamps = np.asarray(error_series['timestamps_s'], dtype=float).reshape(-1)
+    estimated_poses = np.asarray(error_series['estimated_poses'], dtype=float)
+    reference_poses = np.asarray(error_series['reference_poses'], dtype=float)
+
+    if estimated_poses.shape != (len(timestamps), 4, 4):
+        raise ValueError(f'estimated_poses must have shape ({len(timestamps)}, 4, 4), got {estimated_poses.shape}')
+
+    if reference_poses.shape != (len(timestamps), 4, 4):
+        raise ValueError(f'reference_poses must have shape ({len(timestamps)}, 4, 4), got {reference_poses.shape}')
+
+    matrix_columns = [f'T{row_index}{column_index}' for row_index in range(4) for column_index in range(4)]
+    columns = ['timestamp_s', *[f'estimated_{column}' for column in matrix_columns], *[f'reference_{column}' for column in matrix_columns]]
+    values = np.column_stack((timestamps, estimated_poses.reshape(len(timestamps), 16), reference_poses.reshape(len(timestamps), 16)))
+
+    np.savetxt(path, values, delimiter=',', header=','.join(columns), comments='', fmt='%.17g')
 
     return path
 
@@ -516,15 +654,36 @@ def build_variable_configs(
     lidar_right_tau_key: VariableKey,
     right_lidar_active: bool,
     imu_prior_source: str,
+    imu_extrinsic_rotation_prior_information: float,
+    imu_extrinsic_translation_prior_information: float,
     imu_tau_initial: float,
     imu_tau_prior_information: float,
+    lidar_extrinsic_rotation_prior_information: float,
+    lidar_extrinsic_translation_prior_information: float,
+    lidar_tau_prior_information: float,
     right_lidar_tau_initial: float,
-    right_lidar_tau_prior_information: float,
     bias_prior_information: float,
 ) -> dict[VariableKey, VariableConfig]:
     '''Create calibration-variable configuration for one execution mode.'''
 
-    T_B_I_prior_information = np.diag(DEFAULT_T_B_I_PRIOR_INFORMATION_DIAG)
+    T_B_I_prior_information = np.diag([
+        imu_extrinsic_rotation_prior_information,
+        imu_extrinsic_rotation_prior_information,
+        imu_extrinsic_rotation_prior_information,
+        imu_extrinsic_translation_prior_information,
+        imu_extrinsic_translation_prior_information,
+        imu_extrinsic_translation_prior_information,
+    ])
+
+    T_B_L_prior_information = np.diag([
+        lidar_extrinsic_rotation_prior_information,
+        lidar_extrinsic_rotation_prior_information,
+        lidar_extrinsic_rotation_prior_information,
+        lidar_extrinsic_translation_prior_information,
+        lidar_extrinsic_translation_prior_information,
+        lidar_extrinsic_translation_prior_information,
+    ])
+
     bias_estimate_initial = np.zeros(3, dtype=float)
 
     if mode == 'with-calibration':
@@ -564,7 +723,7 @@ def build_variable_configs(
                 fixed=False,
                 prior_source='optimized',
                 prior_value=T_B_RL_INITIAL,
-                prior_information=T_B_I_prior_information,
+                prior_information=T_B_L_prior_information,
             )
 
             variable_configs[lidar_right_tau_key] = VariableConfig(
@@ -573,7 +732,7 @@ def build_variable_configs(
                 fixed=False,
                 prior_source='constant',
                 prior_value=0.0,
-                prior_information=right_lidar_tau_prior_information,
+                prior_information=lidar_tau_prior_information,
             )
 
         return variable_configs
@@ -631,15 +790,19 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument('--accel-information', type=float, default=1.0, help='Accelerometer factor information.')
     parser.add_argument('--lidar-rotation-information', type=float, default=1e-2, help='Rotation information for relative LiDAR odometry factors.')
     parser.add_argument('--lidar-translation-information', type=float, default=1.0, help='Translation information for relative LiDAR odometry factors.')
-    parser.add_argument('--map-pose-rotation-information', type=float, default=1.0, help='Rotation information for absolute LiDAR map-pose factors.')
-    parser.add_argument('--map-pose-translation-information', type=float, default=1e2, help='Translation information for absolute LiDAR map-pose factors.')
+    parser.add_argument('--map-pose-rotation-information', type=float, default=1e4, help='Rotation information for absolute LiDAR map-pose factors.')
+    parser.add_argument('--map-pose-translation-information', type=float, default=1e-3, help='Translation information for absolute LiDAR map-pose factors.')
 
     parser.add_argument('--imu-prior-source', choices=('optimized', 'constant', 'numerical', 'default'), default='optimized', help='Soft-prior source for free IMU calibration variables.')
+    parser.add_argument('--imu-extrinsic-rotation-prior-information', type=float, default=1e1, help='Rotational information applied to each of the three IMU-extrinsic rotation components.')
+    parser.add_argument('--imu-extrinsic-translation-prior-information', type=float, default=1e3, help='Translational information applied to each of the three IMU-extrinsic translation components.')
     parser.add_argument('--imu-tau-initial', type=float, default=0.0, help='Initial IMU time offset.')
     parser.add_argument('--imu-tau-prior-information', type=float, default=1e2, help='Information of the IMU temporal-offset prior.')
+    parser.add_argument('--lidar-extrinsic-rotation-prior-information', type=float, default=1e1, help='Rotational information applied to each of the three free LiDAR-extrinsic rotation components.')
+    parser.add_argument('--lidar-extrinsic-translation-prior-information', type=float, default=1e3, help='Translational information applied to each of the three free LiDAR-extrinsic translation components.')
     parser.add_argument('--right-lidar-tau-initial', type=float, default=0.0, help='Initial right-LiDAR temporal offset.')
-    parser.add_argument('--right-lidar-tau-prior-information', type=float, default=1e2, help='Information of the right-LiDAR temporal-offset prior.')
-    parser.add_argument('--bias-prior-information', type=float, default=1e5, help='Gyroscope-bias prior information.')
+    parser.add_argument('--lidar-tau-prior-information', '--right-lidar-tau-prior-information', dest='lidar_tau_prior_information', type=float, default=1e2, help='Information of the free LiDAR temporal-offset prior. Currently this applies to the right LiDAR. --right-lidar-tau-prior-information is retained as a backwards-compatible alias.')
+    parser.add_argument('--bias-prior-information', type=float, default=1e2, help='Gyroscope-bias prior information.')
     parser.add_argument('--gravity-z', type=float, default=9.81, help='World gravity Z component passed to the accelerometer stream.')
 
     parser.add_argument('--window-size', type=float, default=500.0, help='Rolling window size in seconds.')
@@ -765,6 +928,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             lidar_pose_timestamps_right = np.empty(0, dtype=float)
             lidar_poses_right = np.empty((0, 4, 4), dtype=float)
 
+
         ##################################################
         # Local graph world frame
         ##################################################
@@ -860,7 +1024,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         T_W_B_ALIGNMENT = np.asarray(data_processing._interpolate_pose(true_timestamps, true_poses, alignment_timestamp), dtype=float)
         T_W_LL_ALIGNMENT = T_W_B_ALIGNMENT @ T_B_LL_INITIAL
         T_LL0_LL_ALIGNMENT = lidar_poses[alignment_index]
-
         # Since
         #
         #     T_W_LL_ALIGNMENT = T_W_LL0 @ T_LL0_LL_ALIGNMENT,
@@ -875,7 +1038,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
         T_W_O = np.linalg.inv(T_O_W)
         T_O_LL0 = T_O_W @ T_W_LL0
-
         # Convert the complete accumulated odometry trajectory into graph-frame
         # absolute Left-LiDAR poses. These poses are used only for trajectory
         # initialization. LidarOdometryStream still receives the raw accumulated
@@ -968,7 +1130,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
         args.map_pose_translation_information,
         args.map_pose_translation_information,
     ])
-
     ##################################################
     # LiDAR streams
     ##################################################
@@ -1063,7 +1224,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     lidar_right_tau_key = VariableKey('lidar_1', VariableType.TIME_OFFSET)
 
     right_lidar_active = lidar_pose_right_stream is not None or lidar_right_stream is not None
-
     ##################################################
     # Calibration mode
     ##################################################
@@ -1079,10 +1239,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
         lidar_right_tau_key=lidar_right_tau_key,
         right_lidar_active=right_lidar_active,
         imu_prior_source=args.imu_prior_source,
+        imu_extrinsic_rotation_prior_information=args.imu_extrinsic_rotation_prior_information,
+        imu_extrinsic_translation_prior_information=args.imu_extrinsic_translation_prior_information,
         imu_tau_initial=args.imu_tau_initial,
         imu_tau_prior_information=args.imu_tau_prior_information,
+        lidar_extrinsic_rotation_prior_information=args.lidar_extrinsic_rotation_prior_information,
+        lidar_extrinsic_translation_prior_information=args.lidar_extrinsic_translation_prior_information,
+        lidar_tau_prior_information=args.lidar_tau_prior_information,
         right_lidar_tau_initial=args.right_lidar_tau_initial,
-        right_lidar_tau_prior_information=args.right_lidar_tau_prior_information,
         bias_prior_information=args.bias_prior_information,
     )
 
@@ -1143,7 +1307,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
     log(args.verbosity, 1, 'Initial-pose timestamp mismatch [s]:', true_timestamps[first_lidar_true_index] - window_pose_timestamps[0])
     log(args.verbosity, 1, 'Trajectory initialization poses:', init_lidar_poses.shape)
     log(args.verbosity, 1, 'Rolling window / step [s]:', args.window_size, '/', args.step_size)
-
     ##################################################
     # Solve rolling graph
     ##################################################
@@ -1252,8 +1415,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         'map_pose_translation_information': float(args.map_pose_translation_information),
         'imu_tau_initial_s': float(args.imu_tau_initial),
         'right_lidar_tau_initial_s': float(args.right_lidar_tau_initial),
+        'imu_extrinsic_rotation_prior_information': float(args.imu_extrinsic_rotation_prior_information),
+        'imu_extrinsic_translation_prior_information': float(args.imu_extrinsic_translation_prior_information),
         'imu_tau_prior_information': float(args.imu_tau_prior_information),
-        'right_lidar_tau_prior_information': float(args.right_lidar_tau_prior_information),
+        'lidar_extrinsic_rotation_prior_information': float(args.lidar_extrinsic_rotation_prior_information),
+        'lidar_extrinsic_translation_prior_information': float(args.lidar_extrinsic_translation_prior_information),
+        'lidar_tau_prior_information': float(args.lidar_tau_prior_information),
         'bias_prior_information': float(args.bias_prior_information),
         'gravity_z_mps2': float(args.gravity_z),
         'estimated_pose_count': int(len(estimated_timestamps)),
@@ -1263,6 +1430,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     }
 
     trajectory_error_pickle_path = errors_dir / 'trajectory_errors.pkl'
+    trajectory_csv_path = errors_dir / 'trajectory.csv'
 
     save_trajectory_error_pickle(
         trajectory_error_pickle_path,
@@ -1275,10 +1443,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
         run_config=run_config,
     )
 
+    save_trajectory_csv(trajectory_csv_path, trajectory_error_series)
+
     ##################################################
     # Plot calibration estimates / errors
     ##################################################
-
     calibration_keys = [imu_extrinsic_key, imu_tau_key, imu_bias_key, lidar_extrinsic_key, lidar_tau_key]
 
     reference_values = {
@@ -1293,6 +1462,24 @@ def run_pipeline(args: argparse.Namespace) -> None:
         calibration_keys.extend([lidar_right_extrinsic_key, lidar_right_tau_key])
         reference_values[lidar_right_extrinsic_key] = T_B_RL_INITIAL
         reference_values[lidar_right_tau_key] = TAU_L_REFERENCE
+
+    ##################################################
+    # Save calibration-variable histories
+    ##################################################
+
+    calibration_variables_pickle_path = errors_dir / 'calibration_variables.pkl'
+
+    save_calibration_variables_pickle(
+        calibration_variables_pickle_path,
+        dataset_name=dataset_name,
+        mode=args.mode,
+        lidar_mode=args.lidar_mode,
+        results=results,
+        calibration_keys=calibration_keys,
+        reference_values=reference_values,
+        variable_configs=variable_configs,
+        run_config=run_config,
+    )
 
     calibration_figure, _ = plot_calibration_estimates(results, calibration_keys, reference_values=reference_values)
     calibration_plot_path = plots_dir / 'calibration_errors.png'
@@ -1322,6 +1509,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
         print(benchmark_plot_path)
         print(calibration_plot_path)
         print(trajectory_error_pickle_path)
+        print(trajectory_csv_path)
+        print(calibration_variables_pickle_path)
 
 
 ##################################################
@@ -1349,6 +1538,20 @@ def main() -> None:
 
     if args.imu_frequency_hz <= 0.0:
         parser.error('--imu-frequency-hz must be positive.')
+
+    prior_information_arguments = {
+        '--imu-extrinsic-rotation-prior-information': args.imu_extrinsic_rotation_prior_information,
+        '--imu-extrinsic-translation-prior-information': args.imu_extrinsic_translation_prior_information,
+        '--imu-tau-prior-information': args.imu_tau_prior_information,
+        '--lidar-extrinsic-rotation-prior-information': args.lidar_extrinsic_rotation_prior_information,
+        '--lidar-extrinsic-translation-prior-information': args.lidar_extrinsic_translation_prior_information,
+        '--lidar-tau-prior-information': args.lidar_tau_prior_information,
+        '--bias-prior-information': args.bias_prior_information,
+    }
+
+    for argument_name, information in prior_information_arguments.items():
+        if not np.isfinite(information) or information <= 0.0:
+            parser.error(f'{argument_name} must be finite and positive.')
 
     run_pipeline(args)
 

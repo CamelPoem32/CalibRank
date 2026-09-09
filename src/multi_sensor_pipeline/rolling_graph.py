@@ -938,12 +938,12 @@ class RollingGraph:
 
         current_start = required_start
 
-        while current_start < required_end:
-            window_starts.append(
-                float(current_start)
-            )
+        while current_start < required_end and current_start + float(window_size) <= required_end:
+            window_starts.append(float(current_start))
 
             current_start += float(step_size)
+        # Append last window until required_end + something
+        window_starts.append(float(current_start))
 
         ##################################################
         # Build, optimize, and commit every window
@@ -951,7 +951,10 @@ class RollingGraph:
 
         enumerator = enumerate(window_starts)
         if verbose > -1: enumerator = enumerate(tqdm(window_starts))
+        break_flag = False
         for window_index, current_window_start in enumerator:
+            if break_flag:
+                break
             current_window_end = min(
                 current_window_start + float(window_size),
                 required_end,
@@ -983,11 +986,8 @@ class RollingGraph:
                 current_window_end >= required_end
             )
 
-            commit_end = (
-                required_end
-                if is_last_window
-                else current_window_start + float(step_size)
-            )
+            commit_end = (required_end if is_last_window
+                else current_window_start + float(step_size))
 
             self.rolling_state.commit_output_segment(
                 result.pose_timestamps,
@@ -997,7 +997,7 @@ class RollingGraph:
             )
 
             if is_last_window:
-                break
+                break_flag = True
 
         ##################################################
         # Detach results before optionally releasing native graph memory
