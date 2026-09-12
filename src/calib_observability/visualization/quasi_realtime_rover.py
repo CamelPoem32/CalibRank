@@ -79,6 +79,7 @@ class QuasiRealtimeConfig:
         max_analysis_windows: Optional uniformly distributed snapshot budget,
             applied before any Jacobian assembly. None keeps the full schedule.
         n_processes: Number of analysis worker processes; one runs sequentially.
+        optimize: Use compact projection/SVDs and omit redundant rank revalidation.
         use_sparse (bool): Whether to assemble and project sparse Jacobians.
         relative_rank_threshold (float): Relative threshold retained for legacy
             rank displays.
@@ -128,6 +129,7 @@ class QuasiRealtimeConfig:
     normalize_J_C_factor_blocks_for_display: bool = True
     max_analysis_windows: int | None = None
     n_processes: int = 1
+    optimize: bool = False
 
 
 @dataclass(frozen=True)
@@ -673,6 +675,7 @@ def build_window_snapshot(
                     bundle,
                     variable_name,
                     normalization=config.normalization,
+                    optimize=config.optimize,
                     relative_rank_threshold=config.relative_rank_threshold,
                     practical_rank_policy=config.practical_rank_policy,
                     tau_target_std_seconds=config.tau_target_std_seconds,
@@ -684,6 +687,7 @@ def build_window_snapshot(
                     bundle,
                     variable_name,
                     normalization=config.normalization,
+                    optimize=config.optimize,
                     relative_rank_threshold=config.relative_rank_threshold,
                     practical_rank_policy=config.practical_rank_policy,
                     tau_target_std_seconds=config.tau_target_std_seconds,
@@ -706,7 +710,10 @@ def build_window_snapshot(
             tau_std_bounds_lidar_frames[variable_name] = float(accuracy.scalar_std_bound_lidar_frames) if accuracy.scalar_std_bound_lidar_frames is not None else np.nan
             tau_target_ratio[variable_name] = float(accuracy.target_ratio) if accuracy.target_ratio is not None else np.nan
             tau_meets_target[variable_name] = bool(accuracy.meets_target) if accuracy.meets_target is not None else False
-        validate_stored_rank_against_matrix(result.O_X_physical, result.practical_rank_diagnostics, config.practical_rank_policy)
+        # The optimized path shares the canonical SVD with accuracy diagnostics.
+        # Independent recomputation remains available for tests and benchmarks.
+        if not config.optimize:
+            validate_stored_rank_against_matrix(result.O_X_physical, result.practical_rank_diagnostics, config.practical_rank_policy)
         target_O_display[variable_name] = matrix_for_display(
             result.O_X_physical,
             max_rows=config.max_display_rows,
@@ -982,6 +989,7 @@ def build_observability_visualization_series(
     show_local_accuracy_summary: bool = True,
     verbose=False,
     n_processes: int = 1,
+    optimize: bool = False,
 ) -> ObservabilityVisualizationSeries:
     '''Build canonical visualization arrays for notebooks 04 and 07.
 
@@ -1008,6 +1016,7 @@ def build_observability_visualization_series(
         show_local_accuracy_summary (bool): Dashboard local-accuracy flag.
         verbose: Show progress over completed analysis windows.
         n_processes: Analysis worker count; one keeps serial execution.
+        optimize: Use compact projection/SVDs and omit redundant rank revalidation.
 
     Returns:
         ObservabilityVisualizationSeries: Canonical snapshots and aligned arrays.
@@ -1022,6 +1031,7 @@ def build_observability_visualization_series(
         frame_step=window_step,
         max_analysis_windows=max_analysis_windows,
         n_processes=n_processes,
+        optimize=optimize,
         use_sparse=use_sparse,
         normalization=normalization,
         display_variables=display_variables,

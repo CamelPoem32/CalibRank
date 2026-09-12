@@ -103,3 +103,38 @@ dataset/provider once per process, including supported local trajectory closures
 Each worker needs memory for its dataset copy and active analysis window.
 Standalone Python scripts must invoke parallel analysis under
 `if __name__ == "__main__":`. The provided CLI already does this.
+
+## Optional optimized analysis and notebook 23
+
+The default remains optimize=False. Pass --optimize to the CLI, or set
+KaistObservabilityConfig(dataset_root=..., optimize=True) in Python. Use
+--no-optimize for an explicit legacy comparison. The flag also reaches rolling
+analysis, its process workers, and dense/sparse per-target projection helpers.
+
+The dense optimized branch applies the retained nuisance SVD basis directly
+instead of allocating I - J_N @ pinv(J_N). Its cutoff remains 1e-15, matching the
+legacy pseudoinverse. For retained nuisance condition numbers above 1e8, it
+reconstructs the legacy projector from the same SVD to preserve floating-point
+behavior; these exceptional cases still allocate the dense projector. Right SVDs are reused within each target calculation;
+tall matrices use economy SVD, while wide matrices retain their full right null
+space. Physical and column-filtered matrices keep separate decompositions when
+filtering changes the matrix. No cache survives a target evaluation.
+Sparse LSMR solves, Jacobian assembly, noise models and practical-rank/CRLB
+definitions remain unchanged. The optimized rolling path omits redundant rank
+recomputation; validate_stored_rank_against_matrix remains available for audits.
+Roundoff-level machine ranks can differ between projection algorithms.
+
+Notebook notebooks/23_kaist_observability_optimization_benchmark.ipynb loads
+Urban16 through load_observability_inputs and calls analyze_observability_inputs,
+the same numerical function used by run_observability. It needs the existing
+KAIST map-pose CSV and the dev dependencies (including pandas and threadpoolctl).
+Adjust its dataset, interval, window size, dense/sparse, process and BLAS controls
+before running all cells. It warms both branches, checks practical ranks,
+subspaces and uncertainty, then alternates timed runs and saves CSV comparisons,
+a timing plot and environment metadata under outputs/kaist_observability_optimization.
+
+Analysis timing excludes input loading and rendering. A second benchmark uses
+a preassembled KAIST bundle to isolate projection and diagnostics. Equal BLAS
+thread counts apply to both modes and spawned workers. Keep separate output
+directories when comparing configurations. These optimizations run on CPU;
+a GPU/autograd implementation is a separate step.

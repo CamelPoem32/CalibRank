@@ -39,6 +39,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-time", type=float, default=0.0, help="Seconds from common overlap start.")
     parser.add_argument("--end-time", type=float, help="Seconds from common overlap start.")
     parser.add_argument("--use-sparse", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--optimize", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use compact nuisance projection and reuse target SVDs (default: off).")
     defaults = KaistObservabilityConfig(Path("."))
     parser.add_argument("--verbose", "--verbosity", "-v", type=int, choices=(0, 1, 2),
                         default=defaults.verbose,

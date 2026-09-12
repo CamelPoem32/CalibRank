@@ -11,7 +11,7 @@ from scipy import sparse
 from scipy.linalg import solve
 from scipy.sparse.linalg import lsmr, spsolve
 
-from .linalg import numerical_rank_dense
+from .linalg import numerical_rank_dense, _project_nuisance_svd
 from .lie_se2 import se2_adjoint
 from .lie_se3 import se3_adjoint
 from .types import JacobianOptions
@@ -71,13 +71,15 @@ def trajectory_projector_dense(J_T: ArrayLike) -> NDArray[np.float64]:
     return np.eye(A.shape[0]) - P_T
 
 
-def effective_observability_dense(J_T: ArrayLike, J_C: ArrayLike) -> NDArray[np.float64]:
+def effective_observability_dense(J_T: ArrayLike, J_C: ArrayLike, *, optimize: bool = False) -> NDArray[np.float64]:
     '''Project calibration sensitivity away from the trajectory column space.
     
     Args:
         J_T: Trajectory Jacobian, shape ``(m, n_T)``.
         J_C: Calibration Jacobian, shape ``(m, n_C)``.
     
+        optimize: Apply the projector through its SVD basis without forming it.
+
     Returns:
         Projected calibration matrix ``O_C``, shape ``(m, n_C)``.
     
@@ -89,6 +91,8 @@ def effective_observability_dense(J_T: ArrayLike, J_C: ArrayLike) -> NDArray[np.
     C = np.asarray(J_C, dtype=float)
     if T.ndim != 2 or C.ndim != 2 or T.shape[0] != C.shape[0]:
         raise ValueError("J_T and J_C must be matrices with the same row count")
+    if optimize:
+        return _project_nuisance_svd(T, C)
     P = trajectory_projector_dense(T)
     # P: (m, m), C: (m, n_C) -> O_C: (m, n_C)
     return P @ C

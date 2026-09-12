@@ -362,3 +362,52 @@ def largest_singular_values_sparse(
         return_singular_vectors=False,
     )
     return np.sort(values)[::-1]
+
+
+class _RightSVDCache:
+    """Reuse right SVDs within one target evaluation, never across mutations.
+
+    Strong references prevent object-id reuse. Tall matrices use economy SVD;
+    wide matrices retain the complete right null space. No left singular-vector
+    matrix is retained in this workspace or the returned diagnostic results.
+    """
+
+    def __init__(self):
+        self._entries = {}
+
+    def decompose(self, matrix):
+        key = id(matrix)
+        if key not in self._entries:
+            _, values, right = np.linalg.svd(
+                matrix, full_matrices=matrix.shape[0] < matrix.shape[1],
+            )
+            self._entries[key] = (matrix, values, right)
+        _, values, right = self._entries[key]
+        return values, right
+
+
+def _project_nuisance_svd(nuisance, target):
+    """Apply the nuisance projector, preserving legacy ill-conditioned results.
+
+    Normally use the retained left SVD basis without a residual-space matrix.
+    The cutoff is 1e-15, matching the legacy NumPy pinv call. If the retained
+    condition number exceeds 1e8, A @ pinv(A) can differ materially from U @ U.T
+    in floating point. Reconstruct the legacy projector from the same SVD in
+    that case. This conservative compatibility fallback changes no rank policy
+    and avoids a second nuisance decomposition.
+    """
+    if not np.isfinite(nuisance).all():
+        raise ValueError("nuisance must be a finite matrix")
+    if not nuisance.size or not target.size:
+        return target.copy()
+    left, values, right = np.linalg.svd(nuisance, full_matrices=False)
+    retained = values > 1e-15 * values[0]
+    if np.any(retained) and values[0] / values[retained][-1] > 1e8:
+        # Match np.linalg.pinv's multiplication order as well as its cutoff.
+        inverse_values = np.zeros_like(values)
+        np.divide(1.0, values, out=inverse_values, where=retained)
+        pseudoinverse = right.T @ (inverse_values[:, None] * left.T)
+        projector = nuisance @ pseudoinverse
+        return (np.eye(nuisance.shape[0]) - projector) @ target
+    basis = left[:, retained]
+    return target - basis @ (basis.T @ target)

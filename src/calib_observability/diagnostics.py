@@ -16,7 +16,7 @@ from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 from scipy.linalg import solve
 
-from .linalg import null_space_dense, numerical_rank_dense, singular_value_diagnostics_dense
+from .linalg import _RightSVDCache, null_space_dense, numerical_rank_dense, singular_value_diagnostics_dense
 from .observability import (
     build_motion_only_matrix_dense,
     effective_observability_dense,
@@ -646,6 +646,8 @@ def local_accuracy_diagnostics(
     lidar_rate_hz: float | None = None,
     target_std_seconds: float | None = None,
     coordinate_null_fraction_tolerance: float = COORDINATE_NULL_FRACTION_TOLERANCE,
+    optimize: bool = False,
+    _svd_cache: _RightSVDCache | None = None,
 ) -> LocalAccuracyDiagnostics:
     '''Compute local CRLB-like bounds from a physical projected matrix.
 
@@ -669,6 +671,9 @@ def local_accuracy_diagnostics(
         target_std_seconds (float | None): Optional scalar timing target in seconds.
         coordinate_null_fraction_tolerance (float): Maximum null-space fraction for
             treating a coordinate as fully bounded.
+
+        optimize: Use a compact right SVD; default preserves the legacy path.
+        _svd_cache: Internal workspace for this evaluation only; inputs must not mutate.
 
     Returns:
         LocalAccuracyDiagnostics: Retained-mode, covariance, projector, coordinate,
@@ -695,8 +700,12 @@ def local_accuracy_diagnostics(
     # Use that same filtered physical matrix, never a normalized display matrix,
     # so retained masks and singular directions are canonical and shared.
     filtered_matrix = np.asarray(practical_rank_result.filtered_matrix, dtype=float)
-    U, singular_values, Vt = np.linalg.svd(filtered_matrix, full_matrices=True)
-    _ = U
+    if optimize:
+        cache = _svd_cache if _svd_cache is not None else _RightSVDCache()
+        singular_values, Vt = cache.decompose(filtered_matrix)
+    else:
+        U, singular_values, Vt = np.linalg.svd(filtered_matrix, full_matrices=True)
+        _ = U
     if not np.allclose(singular_values, practical_rank_result.singular_values, atol=1e-10, rtol=1e-8):
         raise AssertionError("local accuracy singular values must match practical-rank diagnostics")
     retained_mask = np.asarray(practical_rank_result.retained_mask, dtype=bool).copy()
@@ -707,7 +716,7 @@ def local_accuracy_diagnostics(
     # V_retained: (n_X, r). Columns span only the practically retained
     # observable subspace. Rejected singular directions are treated as
     # unbounded rather than assigned a large but finite covariance.
-    V_retained = V[:, retained_mask] if retained_mask.size else np.zeros((n_parameters, 0), dtype=float)
+    V_retained = V[:, :retained_mask.size][:, retained_mask] if retained_mask.size else np.zeros((n_parameters, 0), dtype=float)
 
     information_matrix = matrix.T @ matrix
     information_matrix = 0.5 * (information_matrix + information_matrix.T)
@@ -1046,6 +1055,8 @@ def practical_rank_diagnostics(
     O_physical: ArrayLike | sparse.spmatrix,
     *,
     policy: PracticalRankPolicy = DEFAULT_PRACTICAL_RANK_POLICY,
+    optimize: bool = False,
+    _svd_cache: _RightSVDCache | None = None,
 ) -> PracticalRankDiagnostics:
     '''Apply the canonical practical-rank policy to a physical matrix.
 
@@ -1058,6 +1069,9 @@ def practical_rank_diagnostics(
             shape ``(m, n_X)``.
         policy (PracticalRankPolicy): Column, matrix, and singular-value thresholds.
 
+        optimize: Use a compact right SVD; default preserves the legacy path.
+        _svd_cache: Internal workspace for this evaluation only; inputs must not mutate.
+
     Returns:
         PracticalRankDiagnostics: Column rejection, SVD, rank, condition-number,
         and retained-mode uncertainty diagnostics.
@@ -1069,12 +1083,17 @@ def practical_rank_diagnostics(
     column_threshold = float(policy.column_absolute_threshold + policy.column_relative_threshold * maximum_column_norm)
     zero_column_mask = column_norms <= column_threshold
     active_column_mask = ~zero_column_mask
-    filtered_matrix = matrix.copy()
-    if zero_column_mask.size:
+    # Share the physical decomposition only if filtering changes no columns.
+    filtered_matrix = matrix if optimize and not np.any(zero_column_mask) else matrix.copy()
+    if zero_column_mask.size and np.any(zero_column_mask):
         filtered_matrix[:, zero_column_mask] = 0.0
 
     # singular_values: (min(m, n_X),), descending by construction.
-    singular_values = np.linalg.svd(filtered_matrix, compute_uv=False)
+    if optimize:
+        cache = _svd_cache if _svd_cache is not None else _RightSVDCache()
+        singular_values, _ = cache.decompose(filtered_matrix)
+    else:
+        singular_values = np.linalg.svd(filtered_matrix, compute_uv=False)
     maximum_possible_rank = min(matrix.shape)
     sigma_max = float(singular_values[0]) if singular_values.size else 0.0
     normalized = singular_values / sigma_max if sigma_max > 0.0 else np.zeros_like(singular_values)
@@ -1179,6 +1198,8 @@ def physical_information_diagnostics(
     practical_rank_result: PracticalRankDiagnostics | None = None,
     policy: PracticalRankPolicy = DEFAULT_PRACTICAL_RANK_POLICY,
     relative_rank_threshold: float | None = None,
+    optimize: bool = False,
+    _svd_cache: _RightSVDCache | None = None,
 ) -> PhysicalInformationDiagnostics:
     '''Calculate physical information and retained-mode uncertainty diagnostics.
 
@@ -1195,6 +1216,9 @@ def physical_information_diagnostics(
         relative_rank_threshold (float | None): Backward-compatible override for
             the policy relative threshold.
 
+        optimize: Use a compact right SVD; default preserves the legacy path.
+        _svd_cache: Internal workspace for this evaluation only; inputs must not mutate.
+
     Returns:
         PhysicalInformationDiagnostics: Information matrix, singular values,
         covariance or pseudocovariance, and compatibility aliases.
@@ -1210,7 +1234,11 @@ def physical_information_diagnostics(
     )
     # O_X_physical.T: (n_X, m), O_X_physical: (m, n_X) -> S_X: (n_X, n_X).
     information_matrix = matrix.T @ matrix
-    singular_values = np.linalg.svd(matrix, compute_uv=False)
+    if optimize:
+        cache = _svd_cache if _svd_cache is not None else _RightSVDCache()
+        singular_values, _ = cache.decompose(matrix)
+    else:
+        singular_values = np.linalg.svd(matrix, compute_uv=False)
     information_eigenvalues = singular_values**2
     trace_information = float(np.trace(information_matrix))
     frobenius_norm = float(np.linalg.norm(matrix, ord="fro"))

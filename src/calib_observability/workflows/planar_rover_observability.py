@@ -1539,6 +1539,7 @@ def save_simple_accelerometer_dashboard(
     save_html=True,
     verbose=True,
     n_processes: int = 1,
+    optimize: bool = False,
 ) -> tuple[ObservabilityVisualizationSeries, Path]:
     '''Run simple-accelerometer diagnostics and save the live dashboard.
 
@@ -1553,6 +1554,7 @@ def save_simple_accelerometer_dashboard(
         max_analysis_windows: Optional snapshot cap before analysis and storage.
         verbose: Show analysis-window progress and MP4 renderer output.
         n_processes: Number of analysis processes; one executes sequentially.
+        optimize: Use compact nuisance elimination and reuse target SVDs.
         accelerometer_options: Accelerometer configuration with mode ``simple``.
         fixed_extrinsic: Body-frame convention.
         practical_rank_policy: Practical-rank threshold policy.
@@ -1593,6 +1595,7 @@ def save_simple_accelerometer_dashboard(
         normalization=normalization, max_display_rows=max_display_rows, max_display_cols=max_display_cols, lidar_rate_hz=lidar_rate_hz,
         coordinate_null_fraction_tolerance=coordinate_null_fraction_tolerance, show_local_accuracy_summary=True, verbose=verbose,
         n_processes=n_processes,
+        optimize=optimize,
     )
 
     rendered_snapshots = simple_series.snapshots[::downsample]

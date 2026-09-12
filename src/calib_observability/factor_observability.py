@@ -28,6 +28,7 @@ from scipy.sparse.linalg import lsmr
 from scipy.linalg import cho_factor, cho_solve
 
 from .assembly import JacobianBundle
+from .linalg import _RightSVDCache, _project_nuisance_svd
 from .lie_se3 import se3_adjoint
 from .scaling import scale_jacobian_dense, scale_jacobian_sparse
 from .diagnostics import (
@@ -522,6 +523,8 @@ def _column_norms(
 def _machine_null_space(
     matrix: ArrayLike | sparse.spmatrix,
     machine_rank: int,
+    *,
+    _svd_cache: _RightSVDCache | None = None,
 ) -> NDArray[np.float64]:
     '''Return the right-singular-vector basis below the machine rank.
 
@@ -533,10 +536,13 @@ def _machine_null_space(
         Null-space basis with shape ``(n, n - machine_rank)``.
     '''
 
-    _, _, Vt = np.linalg.svd(
-        _dense(matrix),
-        full_matrices=True,
-    )
+    if _svd_cache is not None:
+        _, Vt = _svd_cache.decompose(_dense(matrix))
+    else:
+        _, _, Vt = np.linalg.svd(
+            _dense(matrix),
+            full_matrices=True,
+        )
 
     return Vt[machine_rank:].T.copy()
 
@@ -1054,6 +1060,8 @@ def _normalize_projected_matrix(
 ##################################################
 def covariance_from_physical_information(
     physical_matrix: ArrayLike | sparse.spmatrix,
+    *,
+    _svd_cache: _RightSVDCache | None = None,
 ) -> tuple[NDArray[np.float64] | None, float, str]:
     '''Compute covariance from a full-column-rank physical Jacobian.
 
@@ -1071,10 +1079,13 @@ def covariance_from_physical_information(
 
     # Use the physical matrix directly. A merely column-normalized matrix would
     # discard the relative parameter information required by covariance.
-    _, singular_values, Vt = np.linalg.svd(
-        J_p,
-        full_matrices=False,
-    )
+    if _svd_cache is not None:
+        singular_values, Vt = _svd_cache.decompose(J_p)
+    else:
+        _, singular_values, Vt = np.linalg.svd(
+            J_p,
+            full_matrices=False,
+        )
     diagnostics = rank_diagnostics_from_singular_values(
         singular_values,
         J_p.shape,
@@ -1146,6 +1157,7 @@ def _make_target_result(
     variable_name: str = "target",
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
+    optimize: bool = False,
 ) -> EffectiveTargetObservabilityResult:
     '''Assemble all diagnostics for one projected target matrix.
 
@@ -1163,6 +1175,8 @@ def _make_target_result(
         coordinate_null_fraction_tolerance: Null-projection tolerance used for
             coordinate-wise boundedness.
 
+        optimize: Avoid dense projectors and reuse compact target decompositions.
+
     Returns:
         Complete projected target observability result.
 
@@ -1179,15 +1193,20 @@ def _make_target_result(
     )
     diagnostic_matrix = _dense(normalized.normalized_jacobian)
     physical_matrix = _dense(O_X_raw)
+    svd_cache = _RightSVDCache() if optimize else None
 
     practical = practical_rank_diagnostics(
         physical_matrix,
         policy=practical_rank_policy,
+        optimize=optimize,
+        _svd_cache=svd_cache,
     )
     information = physical_information_diagnostics(
         physical_matrix,
         practical_rank_result=practical,
         policy=practical_rank_policy,
+        optimize=optimize,
+        _svd_cache=svd_cache,
     )
 
     # Scalar time-offset variables expose a dedicated physical sensitivity and
@@ -1213,6 +1232,8 @@ def _make_target_result(
     accuracy = local_accuracy_diagnostics(
         physical_matrix,
         variable_name=variable_name,
+        optimize=optimize,
+        _svd_cache=svd_cache,
         coordinate_labels=coordinate_labels,
         coordinate_units=coordinate_units,
         practical_rank_result=practical,
@@ -1244,12 +1265,13 @@ def _make_target_result(
     null_space = _machine_null_space(
         physical_matrix,
         practical.machine_rank,
+        _svd_cache=svd_cache,
     )
     (
         covariance,
         ordinary_condition_number,
         covariance_note,
-    ) = covariance_from_physical_information(O_X_raw)
+    ) = covariance_from_physical_information(physical_matrix, _svd_cache=svd_cache)
 
     machine_rank_threshold = (
         max(physical_matrix.shape)
@@ -1314,6 +1336,7 @@ def effective_target_observability_dense(
     variable_name: str = "target",
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
+    optimize: bool = False,
 ) -> EffectiveTargetObservabilityResult:
     '''Project a dense target block away from nuisance-variable sensitivity.
 
@@ -1331,6 +1354,8 @@ def effective_target_observability_dense(
         variable_name: Target calibration variable name.
         lidar_rate_hz: Optional LiDAR rate for timing conversion.
         coordinate_null_fraction_tolerance: Coordinate boundedness tolerance.
+
+        optimize: Avoid dense projectors and reuse compact target decompositions.
 
     Returns:
         Complete dense target observability diagnostics.
@@ -1356,6 +1381,8 @@ def effective_target_observability_dense(
     # Remove residual changes reproducible by the nuisance variables.
     if J_N.shape[1] == 0:
         O_X_raw = J_X.copy()
+    elif optimize:
+        O_X_raw = _project_nuisance_svd(J_N, J_X)
     else:
         P_N = J_N @ np.linalg.pinv(J_N)
         O_X_raw = (
@@ -1382,6 +1409,7 @@ def effective_target_observability_dense(
         resolved_nuisance_labels,
         sparse_nnz=None,
         variable_name=variable_name,
+        optimize=optimize,
         lidar_rate_hz=lidar_rate_hz,
         coordinate_null_fraction_tolerance=(
             coordinate_null_fraction_tolerance
@@ -1404,6 +1432,7 @@ def effective_target_observability_sparse_lsmr(
     variable_name: str = "target",
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
+    optimize: bool = False,
 ) -> EffectiveTargetObservabilityResult:
     '''Project a sparse target block using independent LSMR nuisance solves.
 
@@ -1421,6 +1450,8 @@ def effective_target_observability_sparse_lsmr(
         variable_name: Target calibration variable name.
         lidar_rate_hz: Optional LiDAR rate for timing conversion.
         coordinate_null_fraction_tolerance: Coordinate boundedness tolerance.
+
+        optimize: Avoid dense projectors and reuse compact target decompositions.
 
     Returns:
         Complete sparse target observability diagnostics.
@@ -1507,6 +1538,7 @@ def effective_target_observability_sparse_lsmr(
         resolved_nuisance_labels,
         sparse_nnz=int(O_X_raw.nnz),
         variable_name=variable_name,
+        optimize=optimize,
         lidar_rate_hz=lidar_rate_hz,
         coordinate_null_fraction_tolerance=(
             coordinate_null_fraction_tolerance
@@ -1591,6 +1623,7 @@ def effective_target_observability_from_bundle_dense(
     tau_target_std_seconds: float | None = None,
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
+    optimize: bool = False,
 ) -> EffectiveTargetObservabilityResult:
     '''Analyze one active variable from a dense Jacobian bundle.
 
@@ -1605,6 +1638,8 @@ def effective_target_observability_from_bundle_dense(
         tau_target_std_seconds: Optional scalar timing accuracy requirement.
         lidar_rate_hz: Optional LiDAR rate for timing conversion.
         coordinate_null_fraction_tolerance: Coordinate boundedness tolerance.
+
+        optimize: Avoid dense projectors and reuse compact target decompositions.
 
     Returns:
         Projected target observability diagnostics.
@@ -1634,6 +1669,7 @@ def effective_target_observability_from_bundle_dense(
         practical_rank_policy=practical_rank_policy,
         tau_target_std_seconds=tau_target_std_seconds,
         variable_name=variable_name,
+        optimize=optimize,
         lidar_rate_hz=lidar_rate_hz,
         coordinate_null_fraction_tolerance=(
             coordinate_null_fraction_tolerance
@@ -1653,6 +1689,7 @@ def effective_target_observability_from_bundle_sparse(
     tau_target_std_seconds: float | None = None,
     lidar_rate_hz: float | None = None,
     coordinate_null_fraction_tolerance: float = 1e-6,
+    optimize: bool = False,
 ) -> EffectiveTargetObservabilityResult:
     '''Analyze one active variable from a sparse Jacobian bundle.
 
@@ -1667,6 +1704,8 @@ def effective_target_observability_from_bundle_sparse(
         tau_target_std_seconds: Optional scalar timing accuracy requirement.
         lidar_rate_hz: Optional LiDAR rate for timing conversion.
         coordinate_null_fraction_tolerance: Coordinate boundedness tolerance.
+
+        optimize: Avoid dense projectors and reuse compact target decompositions.
 
     Returns:
         Projected target observability diagnostics.
@@ -1702,6 +1741,7 @@ def effective_target_observability_from_bundle_sparse(
         practical_rank_policy=practical_rank_policy,
         tau_target_std_seconds=tau_target_std_seconds,
         variable_name=variable_name,
+        optimize=optimize,
         lidar_rate_hz=lidar_rate_hz,
         coordinate_null_fraction_tolerance=(
             coordinate_null_fraction_tolerance
@@ -2114,6 +2154,7 @@ def sliding_window_factor_diagnostics(
     practical_rank_policy: PracticalRankPolicy = DEFAULT_PRACTICAL_RANK_POLICY,
     fixed_extrinsic: str = "none",
     tau_target_std_seconds: float | None = None,
+    optimize: bool = False,
 ) -> list[SlidingWindowFactorDiagnostics]:
     '''Run factor-specific diagnostics over sliding time windows.
 
@@ -2130,6 +2171,8 @@ def sliding_window_factor_diagnostics(
         practical_rank_policy: Canonical practical-rank policy.
         fixed_extrinsic: Fixed-extrinsic configuration forwarded to the dataset.
         tau_target_std_seconds: Optional scalar timing accuracy requirement.
+
+        optimize: Avoid dense projectors and reuse compact target decompositions.
 
     Returns:
         Ordered diagnostics for every complete window.
@@ -2202,6 +2245,7 @@ def sliding_window_factor_diagnostics(
                         bundle,
                         variable_name,
                         normalization=normalization,
+                        optimize=optimize,
                         relative_rank_threshold=relative_rank_threshold,
                         practical_rank_policy=practical_rank_policy,
                         tau_target_std_seconds=tau_target_std_seconds,
@@ -2213,6 +2257,7 @@ def sliding_window_factor_diagnostics(
                         bundle,
                         variable_name,
                         normalization=normalization,
+                        optimize=optimize,
                         relative_rank_threshold=relative_rank_threshold,
                         practical_rank_policy=practical_rank_policy,
                         tau_target_std_seconds=tau_target_std_seconds,

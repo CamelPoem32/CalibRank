@@ -93,6 +93,7 @@ class KaistObservabilityConfig:
     use_sparse: bool = False
     verbose: int = 0
     n_processes: int = 1
+    optimize: bool = False
 
     def __post_init__(self) -> None:
         """Validate limits and physical settings before loading any files."""
@@ -414,6 +415,55 @@ def _save_diagnostic_csv(series, path):
     return path
 
 
+def analyze_observability_inputs(prepared: PreparedObservability, config: KaistObservabilityConfig):
+    """Run the KAIST numerical pipeline on loaded data, without file I/O or rendering.
+
+    Shared by the CLI and notebook 23 so timings use identical physical settings.
+    config.optimize selects compact nuisance projection and reused SVDs;
+    False preserves the legacy execution path. The prepared data are not mutated.
+    """
+
+    dataset = prepared.dataset
+    provider = estimate_poses_dummy(dataset)
+    lidar_rate = prepared.metadata["effective_rates_hz"]["lidar"]
+
+    options = AccelerometerOptions(
+        mode="simple",
+        factor_rate_hz=lidar_rate,
+        support_half_width_seconds=0.2,
+        gravity_norm_tolerance_m_s2=0.75,
+        low_dynamic_gyro_threshold_rad_s=0.35,
+        require_low_dynamic_gate=True,
+        measurement_std_m_s2=config.simple_accel_noise_std,
+        save_factor_terms=True,
+    )
+
+    # Analyze once; the same series drives PNG, CSV and MP4 exports.
+    if config.verbose >= 1:
+        print(f"Computing at most {config.max_analysis_windows} analysis windows...", flush=True)
+
+    return run_rolling_observability_analysis(
+        dataset,
+        provider,
+        window_duration=config.window_size,
+        window_step=config.step_size,
+        max_analysis_windows=config.max_analysis_windows,
+        fixed_extrinsic="T_B_L",
+        verbose=config.verbose,
+        n_processes=config.n_processes,
+        accelerometer_options=options,
+        jacobian_options=JacobianOptions(method="analytic"),
+        use_sparse=config.use_sparse,
+        optimize=config.optimize,
+        lidar_rate_hz=lidar_rate,
+        tau_target_std_seconds=1.0 / lidar_rate,
+        normalization="physical_then_column",
+        max_display_rows=300,
+        max_display_cols=40,
+    )
+
+
+
 def run_observability(config: KaistObservabilityConfig) -> Path:
     """Analyze one KAIST dataset and export a bounded subprocess MP4 dashboard.
 
@@ -453,42 +503,7 @@ def run_observability(config: KaistObservabilityConfig) -> Path:
         print(json.dumps(jsonable(prepared.metadata), indent=2), flush=True)
 
     dataset = prepared.dataset
-    provider = estimate_poses_dummy(dataset)
-    lidar_rate = prepared.metadata["effective_rates_hz"]["lidar"]
-
-    options = AccelerometerOptions(
-        mode="simple",
-        factor_rate_hz=lidar_rate,
-        support_half_width_seconds=0.2,
-        gravity_norm_tolerance_m_s2=0.75,
-        low_dynamic_gyro_threshold_rad_s=0.35,
-        require_low_dynamic_gate=True,
-        measurement_std_m_s2=config.simple_accel_noise_std,
-        save_factor_terms=True,
-    )
-
-    # Analyze once; the same series drives PNG, CSV and MP4 exports.
-    if config.verbose >= 1:
-        print(f"Computing at most {config.max_analysis_windows} analysis windows...", flush=True)
-
-    series = run_rolling_observability_analysis(
-        dataset,
-        provider,
-        window_duration=config.window_size,
-        window_step=config.step_size,
-        max_analysis_windows=config.max_analysis_windows,
-        fixed_extrinsic="T_B_L",
-        verbose=config.verbose,
-        n_processes=config.n_processes,
-        accelerometer_options=options,
-        jacobian_options=JacobianOptions(method="analytic"),
-        use_sparse=config.use_sparse,
-        lidar_rate_hz=lidar_rate,
-        tau_target_std_seconds=1.0 / lidar_rate,
-        normalization="physical_then_column",
-        max_display_rows=300,
-        max_display_cols=40,
-    )
+    series = analyze_observability_inputs(prepared, config)
 
     valid = sum(snapshot.is_valid for snapshot in series.snapshots)
 
