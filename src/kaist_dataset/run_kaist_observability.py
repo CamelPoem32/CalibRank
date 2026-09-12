@@ -56,7 +56,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "trajectory-samples": (int, "Samples used to draw each full trajectory."),
         "mp4-fps": (float, "MP4 playback frame rate."),
         "mp4-dpi": (int, "MP4 resolution for the 17 x 10 inch dashboard."),
-        "gyro-noise-std": (float, "Gyroscope whitening standard deviation [rad/s]."),
+        "gyro-noise-std": (float, "Raw gyro measurement standard deviation [rad/s]; converted to rotation noise per window."),
         "accel-noise-std": (float, "Accelerometer whitening standard deviation [m/s^2]."),
         "lidar-rotation-noise-std": (float, "Relative LiDAR rotation standard deviation [rad]."),
         "lidar-translation-noise-std": (float, "Relative LiDAR translation standard deviation [m]."),

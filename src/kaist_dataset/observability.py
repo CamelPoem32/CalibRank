@@ -62,11 +62,33 @@ class KaistObservabilityConfig:
     trajectory_samples: int = 700
     mp4_fps: float = 10.0
     mp4_dpi: int = 100
-    gyro_noise_std: float = 0.01
-    accel_noise_std: float = 0.1
-    lidar_rotation_noise_std: float = 0.05
-    lidar_translation_noise_std: float = 0.05
-    simple_accel_noise_std: float = 1e-6
+
+    # Dataset-wide empirical standard deviation of the raw 100 Hz gyroscope rate measurements.
+    # Estimated from 492985 low-dynamics KAIST samples after removing the local per-segment median.
+    # The resulting isotropic sigma is sqrt(trace(Sigma_gyro) / 3) = 1.4993039e-3 rad/s.
+    # Imported windows approximate rotation sigma as this rate sigma * sqrt(median IMU dt * median usable gyro-factor dt).
+    gyro_noise_std: float = 1.4993039e-3
+
+    # Dataset-wide empirical effective standard deviation of the raw 100 Hz accelerometer measurements.
+    # Estimated from the same 492985 low-dynamics KAIST samples after removing the local per-segment median gravity/bias component.
+    # The resulting isotropic sigma is sqrt(trace(Sigma_accel) / 3) = 5.3751302e-2 m/s^2.
+    # This is intentionally larger than the MTi-300 datasheet white-noise floor because it also captures effective vibration/residual-motion noise present in the real vehicle data.
+    accel_noise_std: float = 5.3751302e-2
+
+    # Dataset-wide empirical standard deviation of the rotational part of the derived LiDAR scan-to-map pose measurement.
+    # Estimated from 300896 robust inlier residuals against the KAIST reference trajectory after removing sequence-specific central offsets.
+    # This corresponds to an isotropic rotational measurement noise of approximately 0.00430518 rad = 0.2467 deg.
+    lidar_rotation_noise_std: float = 4.3051839e-3
+
+    # Dataset-wide empirical standard deviation of the translational part of the derived LiDAR scan-to-map pose measurement.
+    # Estimated from the same 300896 robust inlier residuals against the KAIST reference trajectory after removing sequence-specific central offsets.
+    # The resulting isotropic scan-to-map translation measurement noise is approximately 0.0998763 m.
+    lidar_translation_noise_std: float = 9.9876337e-2
+
+    # The simple accelerometer model uses the measured acceleration vector directly as an approximate gravity observation.
+    # It therefore uses the same physical/effective measurement noise as the raw accelerometer observation rather than the previous arbitrary 1e-6 m/s^2 value.
+    simple_accel_noise_std: float = 5.3751302e-2
+
     gravity_z: float = -9.81
     use_sparse: bool = False
     verbose: int = 0
@@ -74,32 +96,31 @@ class KaistObservabilityConfig:
 
     def __post_init__(self) -> None:
         """Validate limits and physical settings before loading any files."""
+
         if self.lidar not in ("left", "right"):
             raise ValueError("lidar must be left or right")
         if self.verbose not in (0, 1, 2):
             raise ValueError("verbose must be 0, 1 or 2")
         if not isinstance(self.n_processes, int) or isinstance(self.n_processes, bool) or self.n_processes < 1:
             raise ValueError("n_processes must be a positive integer")
-        counts = ("max_imu_samples", "max_lidar_poses", "max_ground_truth_poses",
-                  "max_analysis_windows", "max_rendered_frames", "trajectory_samples", "mp4_dpi")
+
+        counts = ("max_imu_samples", "max_lidar_poses", "max_ground_truth_poses", "max_analysis_windows", "max_rendered_frames", "trajectory_samples", "mp4_dpi")
         for name in counts:
             value = getattr(self, name)
             minimum = 3 if name == "max_imu_samples" else 2
             if not isinstance(value, int) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
-        positive = ("imu_frequency_hz", "window_size", "step_size", "mp4_fps",
-                    "gyro_noise_std", "accel_noise_std", "lidar_rotation_noise_std",
-                    "lidar_translation_noise_std", "simple_accel_noise_std")
+
+        positive = ("imu_frequency_hz", "window_size", "step_size", "mp4_fps", "gyro_noise_std", "accel_noise_std", "lidar_rotation_noise_std", "lidar_translation_noise_std", "simple_accel_noise_std")
         for name in positive:
             if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+
         if not np.isfinite(self.gravity_z):
             raise ValueError("gravity_z must be finite")
         if not np.isfinite(self.start_time) or self.start_time < 0:
             raise ValueError("start_time must be finite and nonnegative")
-        if self.end_time is not None and (
-            not np.isfinite(self.end_time) or self.end_time <= self.start_time
-        ):
+        if self.end_time is not None and (not np.isfinite(self.end_time) or self.end_time <= self.start_time):
             raise ValueError("end_time must be finite and greater than start_time")
 
 
@@ -122,8 +143,10 @@ def uniform_sample_indices(count: int, maximum: int) -> np.ndarray:
     Returns:
         Unique increasing integer indices, shape `(min(count, maximum),)`.
     """
+
     if count < 2 or maximum < 2:
         raise ValueError("At least two available and retained samples are required")
+
     return np.rint(np.linspace(0, count - 1, min(count, maximum))).astype(int)
 
 
@@ -140,12 +163,34 @@ def _crop_indices(times, start, end, maximum, *, bracket=False):
     Returns:
         Increasing integer indices into times.
     """
+
     first = int(np.searchsorted(times, start, side="left"))
     stop = int(np.searchsorted(times, end, side="right"))
+
     if bracket:
         first = max(0, first - 1)
         stop = min(len(times), stop + 1)
+
     return first + uniform_sample_indices(stop - first, maximum)
+
+
+def _representative_gyro_rotation_noise_std(imu_timestamps, pose_timestamps, gyro_noise_std):
+    """Convert raw gyro rate noise to one representative integrated-rotation noise standard deviation."""
+
+    imu_dt = np.diff(np.asarray(imu_timestamps, dtype=float))
+    pose_dt = np.diff(np.asarray(pose_timestamps, dtype=float))
+
+    imu_dt = imu_dt[np.isfinite(imu_dt) & (imu_dt > 0.0)]
+    pose_dt = pose_dt[np.isfinite(pose_dt) & (pose_dt > 0.0)]
+
+    if imu_dt.size == 0 or pose_dt.size == 0:
+        raise ValueError("Cannot derive gyro rotation noise without positive IMU and pose timestamp differences")
+
+    median_imu_dt = float(np.median(imu_dt))
+    median_pose_dt = float(np.median(pose_dt))
+    rotation_noise_std = float(gyro_noise_std) * np.sqrt(median_imu_dt * median_pose_dt)
+
+    return rotation_noise_std, median_imu_dt, median_pose_dt
 
 
 def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, truth_poses, config):
@@ -165,9 +210,11 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
     Raises:
         ValueError: Streams have no overlap or insufficient retained support.
     """
+
     imu_times = np.asarray(imu.timestamps_s, dtype=float)
     lidar_times = np.asarray(lidar_times, dtype=float)
     truth_times = np.asarray(truth_times, dtype=float)
+
     for name, times in (("IMU", imu_times), ("LiDAR", lidar_times), ("truth", truth_times)):
         if len(times) < 2 or not np.isfinite(times).all() or np.any(np.diff(times) <= 0):
             raise ValueError(f"{name} requires finite strictly increasing timestamps")
@@ -177,8 +224,10 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
     overlap_end = min(imu_times[-1], lidar_times[-1], truth_times[-1])
     start = overlap_start + config.start_time
     end = overlap_end if config.end_time is None else min(overlap_end, overlap_start + config.end_time)
+
     if end <= start:
         raise ValueError("No common IMU/LiDAR/ground-truth interval remains")
+
     li = _crop_indices(lidar_times, start, end, config.max_lidar_poses)
     start, end = float(lidar_times[li[0]]), float(lidar_times[li[-1]])
     ii = _crop_indices(imu_times, start, end, config.max_imu_samples, bracket=True)
@@ -189,8 +238,10 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
     lt = lidar_times[li] - origin
     it = imu_times[ii] - origin
     gt = truth_times[gi] - origin
+
     local_from_world = np.eye(4)
     local_from_world[:3, 3] = -np.asarray(lidar_poses)[li[0], :3, 3]
+
     local_lidar = local_from_world @ np.asarray(lidar_poses)[li]
     local_truth_body = local_from_world @ np.asarray(truth_poses)[gi]
 
@@ -199,6 +250,11 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
     T_B_L = se3_exp(se3_log(T_B_LL_INITIAL if config.lidar == "left" else T_B_RL_INITIAL))
     T_B_I = se3_exp(se3_log(T_B_I_INITIAL_FOR_DATASET))
     relative_poses = se3_to_relative_se3(local_lidar)
+
+    # gyro_noise_std is raw rate noise [rad/s], while the gyro residual is an integrated rotation [rad].
+    # Use one simple dataset-level white-noise approximation based on the median retained IMU period and median LiDAR-derived pose-knot interval: sigma_rotation = sigma_gyro * sqrt(dt_imu * dt_pose).
+    imu_rotation_residual_std, median_imu_dt, median_pose_dt = _representative_gyro_rotation_noise_std(it, lt, config.gyro_noise_std)
+
     raw_dataset = build_dataset_from_imported_sensor_streams(
         imu_timestamps=it,
         gyroscope=np.asarray(imu.gyro_radps)[ii],
@@ -209,33 +265,43 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
         T_B_L_initial_tangent=se3_log(T_B_L),
         gyro_noise_std=config.gyro_noise_std,
         accel_noise_std=config.accel_noise_std,
-        lidar_pose_noise_std=np.array([config.lidar_rotation_noise_std] * 3 +
-                                     [config.lidar_translation_noise_std] * 3),
+        lidar_pose_noise_std=np.array([config.lidar_rotation_noise_std] * 3 + [config.lidar_translation_noise_std] * 3),
         gravity_world=np.array([0.0, 0.0, config.gravity_z]),
+        imu_rotation_residual_std=imu_rotation_residual_std,
     )
+
     body_trajectory = DiscretePoseTrajectory(lt, local_lidar @ np.linalg.inv(T_B_L))
-    dataset = reframe_dataset_to_fixed_extrinsic(
-        replace(raw_dataset, trajectory=body_trajectory), "T_B_L",
-    )
-    reference = DiscretePoseTrajectory(
-        gt, local_truth_body @ T_B_L, mode="kaist_ground_truth_B_equals_L",
-    )
+    dataset = reframe_dataset_to_fixed_extrinsic(replace(raw_dataset, trajectory=body_trajectory), "T_B_L")
+    reference = DiscretePoseTrajectory(gt, local_truth_body @ T_B_L, mode="kaist_ground_truth_B_equals_L")
 
     # Report actual adapter-retained counts, not merely the requested budgets.
     original = {"imu": len(imu_times), "lidar_poses": len(lidar_times), "ground_truth_poses": len(truth_times)}
     retained = {"imu": len(dataset.imu.sensor_timestamps), "lidar_poses": len(lt), "ground_truth_poses": len(gt)}
+
     effective = {}
     for name, times in (("imu", dataset.imu.sensor_timestamps), ("lidar", lt), ("ground_truth", gt)):
         effective[name] = float((len(times) - 1) / (times[-1] - times[0]))
+
     metadata = {
-        "original_counts": original, "retained_counts": retained,
+        "original_counts": original,
+        "retained_counts": retained,
         "effective_rates_hz": effective,
         "common_overlap_absolute_s": [float(overlap_start), float(overlap_end)],
         "selected_interval_absolute_s": [start, end],
-        "timestamp_origin_s": origin, "T_local_world": local_from_world,
-        "T_vehicle_lidar": T_B_L, "T_vehicle_imu": T_B_I,
-        "T_display_imu": dataset.T_B_I_true, "display_body_frame": f"vlp_{config.lidar}",
+        "timestamp_origin_s": origin,
+        "T_local_world": local_from_world,
+        "T_vehicle_lidar": T_B_L,
+        "T_vehicle_imu": T_B_I,
+        "T_display_imu": dataset.T_B_I_true,
+        "display_body_frame": f"vlp_{config.lidar}",
         "calibration_values_are_linearization_assumptions": True,
+        "gyro_noise_conversion": {
+            "raw_gyro_noise_std_rad_s": float(config.gyro_noise_std),
+            "median_imu_dt_s": median_imu_dt,
+            "median_pose_dt_s": median_pose_dt,
+            "imu_rotation_residual_std_rad": imu_rotation_residual_std,
+            "model": "sigma_rotation = sigma_gyro * sqrt(median_imu_dt * median_pose_dt)",
+        },
         "sampling": "Uniform retained indices over the selected overlap; bracketing IMU/truth support is retained.",
         "sample_caps_applied": {
             "imu": int(np.count_nonzero((imu_times >= start) & (imu_times <= end))) > config.max_imu_samples,
@@ -243,6 +309,7 @@ def prepare_observability_inputs(imu, lidar_times, lidar_poses, truth_times, tru
             "ground_truth": int(np.count_nonzero((truth_times >= start) & (truth_times <= end))) > config.max_ground_truth_poses,
         },
     }
+
     return PreparedObservability(dataset, reference, metadata)
 
 
@@ -255,6 +322,7 @@ def load_observability_inputs(config: KaistObservabilityConfig) -> PreparedObser
     Returns:
         PreparedObservability including resolved source paths in its metadata.
     """
+
     root = Path(config.dataset_root).expanduser().resolve()
     name, sensor_root, truth_path = kaist_dataset_layout(root)
     processed = resolve_processed_data_directory(root, name, config.processed_data_dir, "poses", config.lidar)
@@ -262,17 +330,24 @@ def load_observability_inputs(config: KaistObservabilityConfig) -> PreparedObser
 
     # Load only measurements and precomputed poses; raw point clouds are unused.
     streams = load_imus(sensor_root, target_frequency_hz=config.imu_frequency_hz, max_files=1)
+
     if not streams:
         raise ValueError(f"No IMU streams found under {sensor_root}")
+
     imu_name, imu = next(iter(streams.items()))
     lt, lp = load_successful_lidar_map_poses(lidar_path)
     gt, gp = import_true_trajectory(truth_path)
+
     prepared = prepare_observability_inputs(imu, lt, lp, gt, gp, config)
     prepared.metadata["inputs"] = {
-        "dataset_root": str(root), "processed_data_dir": str(processed),
-        "lidar_csv": str(lidar_path), "ground_truth_csv": str(truth_path),
-        "imu_name": imu_name, "imu_csv": imu.metadata.get("source_path"),
+        "dataset_root": str(root),
+        "processed_data_dir": str(processed),
+        "lidar_csv": str(lidar_path),
+        "ground_truth_csv": str(truth_path),
+        "imu_name": imu_name,
+        "imu_csv": imu.metadata.get("source_path"),
     }
+
     return prepared
 
 
@@ -287,10 +362,12 @@ def _save_comparison(prepared, output, samples):
     Returns:
         Path to the saved PNG.
     """
+
     dataset = prepared.dataset
     times = np.linspace(dataset.start_time, dataset.end_time, samples)
     positions = np.vstack([dataset.trajectory.position_at(t) for t in times])
     reference = np.vstack([prepared.reference_trajectory.position_at(t) for t in times])
+
     fig, axis = plt.subplots(figsize=(10, 8))
     axis.plot(positions[:, 0], positions[:, 1], label="LiDAR-derived trajectory")
     axis.plot(reference[:, 0], reference[:, 1], "--", label="KAIST ground truth")
@@ -299,9 +376,11 @@ def _save_comparison(prepared, output, samples):
     axis.grid(alpha=0.3)
     axis.legend()
     fig.tight_layout()
+
     path = output / "trajectory_comparison.png"
     fig.savefig(path, dpi=120)
     plt.close(fig)
+
     return path
 
 
@@ -315,19 +394,23 @@ def _save_diagnostic_csv(series, path):
     Returns:
         Path to the saved CSV; unbounded diagnostics retain inf/NaN values.
     """
+
     rows = []
+
     for index, snapshot in enumerate(series.snapshots):
-        row = {"time_s": snapshot.current_time, "window_start_s": snapshot.window_start,
-               "valid": snapshot.is_valid, "status": snapshot.status}
+        row = {"time_s": snapshot.current_time, "window_start_s": snapshot.window_start, "valid": snapshot.is_valid, "status": snapshot.status}
+
         for variable in SUPPORTED_CALIBRATION_VARIABLES:
-            for label, values in (("rank", series.ranks), ("condition", series.condition_numbers),
-                                  ("worst_std", series.worst_std_bounds)):
+            for label, values in (("rank", series.ranks), ("condition", series.condition_numbers), ("worst_std", series.worst_std_bounds)):
                 row[f"{variable}_{label}"] = values[variable][index]
+
         rows.append(row)
+
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
     return path
 
 
@@ -343,51 +426,81 @@ def run_observability(config: KaistObservabilityConfig) -> Path:
     Raises:
         RuntimeError: FFmpeg is unavailable or no analysis windows are valid.
     """
+
     if not animation.writers.is_available("ffmpeg"):
         raise RuntimeError("FFmpeg is required for MP4 export. Install it before running this command.")
+
     root = Path(config.dataset_root).expanduser().resolve()
     output = config.output_dir
     output = root / "outputs" / "calib_observability" / config.lidar if output is None else Path(output).expanduser()
+
     if not output.is_absolute():
         output = root / output
+
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
 
     if config.verbose >= 1:
         print(f"Loading KAIST {config.lidar} LiDAR and IMU...", flush=True)
+
     prepared = load_observability_inputs(config)
+
     for name, applied in prepared.metadata["sample_caps_applied"].items():
         if applied and config.verbose >= 1:
             print(f"{name}: sample cap reduced effective rate to {prepared.metadata['effective_rates_hz'][name]:.3f} Hz", flush=True)
+
     if config.verbose >= 2:
         print(json.dumps(jsonable(prepared.metadata), indent=2), flush=True)
+
     dataset = prepared.dataset
     provider = estimate_poses_dummy(dataset)
     lidar_rate = prepared.metadata["effective_rates_hz"]["lidar"]
+
     options = AccelerometerOptions(
-        mode="simple", factor_rate_hz=lidar_rate, support_half_width_seconds=0.2,
-        gravity_norm_tolerance_m_s2=0.75, low_dynamic_gyro_threshold_rad_s=0.35,
-        require_low_dynamic_gate=True, measurement_std_m_s2=config.simple_accel_noise_std,
+        mode="simple",
+        factor_rate_hz=lidar_rate,
+        support_half_width_seconds=0.2,
+        gravity_norm_tolerance_m_s2=0.75,
+        low_dynamic_gyro_threshold_rad_s=0.35,
+        require_low_dynamic_gate=True,
+        measurement_std_m_s2=config.simple_accel_noise_std,
         save_factor_terms=True,
     )
 
     # Analyze once; the same series drives PNG, CSV and MP4 exports.
     if config.verbose >= 1:
         print(f"Computing at most {config.max_analysis_windows} analysis windows...", flush=True)
+
     series = run_rolling_observability_analysis(
-        dataset, provider, window_duration=config.window_size, window_step=config.step_size,
-        max_analysis_windows=config.max_analysis_windows, fixed_extrinsic="T_B_L",
-        verbose=config.verbose, n_processes=config.n_processes,
-        accelerometer_options=options, jacobian_options=JacobianOptions(method="analytic"),
-        use_sparse=config.use_sparse, lidar_rate_hz=lidar_rate,
-        tau_target_std_seconds=1.0 / lidar_rate, normalization="physical_then_column",
-        max_display_rows=300, max_display_cols=40,
+        dataset,
+        provider,
+        window_duration=config.window_size,
+        window_step=config.step_size,
+        max_analysis_windows=config.max_analysis_windows,
+        fixed_extrinsic="T_B_L",
+        verbose=config.verbose,
+        n_processes=config.n_processes,
+        accelerometer_options=options,
+        jacobian_options=JacobianOptions(method="analytic"),
+        use_sparse=config.use_sparse,
+        lidar_rate_hz=lidar_rate,
+        tau_target_std_seconds=1.0 / lidar_rate,
+        normalization="physical_then_column",
+        max_display_rows=300,
+        max_display_cols=40,
     )
+
     valid = sum(snapshot.is_valid for snapshot in series.snapshots)
+
+    if config.verbose >= 2:
+        print(json.dumps({"gyro_noise_conversion": prepared.metadata["gyro_noise_conversion"]}, indent=2), flush=True)
+
     if not valid:
         raise RuntimeError("No valid observability windows; increase the window size or retained sensor counts.")
+
     if config.verbose >= 1:
         print(f"Computed {len(series.snapshots)} windows ({valid} valid). Saving results...", flush=True)
+
     artifacts = {
         "overview": plot_rover_dataset_overview(dataset, output, trajectory_samples=config.trajectory_samples),
         "observability": plot_observability_over_time(series, output),
@@ -399,20 +512,27 @@ def run_observability(config: KaistObservabilityConfig) -> Path:
     # The subprocess receives capped lightweight snapshots and array-backed
     # trajectories. It produces MP4 only and never embeds an HTML animation.
     artifacts["animation"] = save_quasi_realtime_rover_animation_mp4_subprocess(
-        dataset, series.snapshots, output / "observability_dashboard.mp4",
+        dataset,
+        series.snapshots,
+        output / "observability_dashboard.mp4",
         display_variables=SUPPORTED_CALIBRATION_VARIABLES,
         reference_trajectory=prepared.reference_trajectory,
         trajectory_samples=config.trajectory_samples,
         max_rendered_frames=config.max_rendered_frames,
-        mp4_fps=config.mp4_fps, mp4_dpi=config.mp4_dpi,
+        mp4_fps=config.mp4_fps,
+        mp4_dpi=config.mp4_dpi,
         verbose=config.verbose,
-        interval_ms=max(1, round(1000 / config.mp4_fps)), figsize=(17, 10),
+        interval_ms=max(1, round(1000 / config.mp4_fps)),
+        figsize=(17, 10),
     )
+
     summary = {
         **prepared.metadata,
         "configuration": {key: str(value) if isinstance(value, Path) else value for key, value in asdict(config).items()},
-        "output_dir": str(output), "analysis_window_count": len(series.snapshots),
-        "valid_window_count": valid, "analysis_times_s": series.times,
+        "output_dir": str(output),
+        "analysis_window_count": len(series.snapshots),
+        "valid_window_count": valid,
+        "analysis_times_s": series.times,
         "rendered_frame_count": min(len(series.snapshots), config.max_rendered_frames),
         "artifacts": artifacts,
     }
@@ -427,16 +547,20 @@ def run_observability(config: KaistObservabilityConfig) -> Path:
         Returns:
             The value with any nested Paths represented as strings.
         """
+
         if isinstance(value, Path):
             return str(value)
+
         if isinstance(value, dict):
             return {key: paths_to_strings(item) for key, item in value.items()}
+
         return value
 
-    (output / "run_summary.json").write_text(
-        json.dumps(jsonable(paths_to_strings(summary)), indent=2), encoding="utf-8",
-    )
+    (output / "run_summary.json").write_text(json.dumps(jsonable(paths_to_strings(summary)), indent=2), encoding="utf-8")
+
     plt.close("all")
+
     if config.verbose >= 1:
         print(f"Saved results: {output}", flush=True)
+
     return output

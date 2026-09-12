@@ -118,6 +118,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation, Slerp
+from tqdm import tqdm
+
+import sys
+SRC_ROOT = Path(__file__).resolve().parents[1]
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from kaist_dataset.data import import_true_trajectory
 
@@ -680,7 +686,7 @@ def collect_localization_metrics(dataset_root: Path, experiment_dir_name: str, l
     dataset_dirs = sorted((path for path in dataset_root.iterdir() if path.is_dir()), key=lambda path: natural_sort_key(path.name))
     rows = []
 
-    for dataset_dir in dataset_dirs:
+    for dataset_dir in tqdm(dataset_dirs):
         with_path, without_path = dataset_result_paths(dataset_dir, experiment_dir_name, lidar_mode, pickle_name)
 
         if not with_path.is_file() and not without_path.is_file():
@@ -1705,7 +1711,7 @@ def collect_results(dataset_root: Path, experiment_dir_name: str, lidar_mode: st
     with_rows = []
     without_rows = []
 
-    for dataset_dir in dataset_dirs:
+    for dataset_dir in tqdm(dataset_dirs):
         with_path, without_path = dataset_result_paths(dataset_dir, experiment_dir_name, lidar_mode, pickle_name)
 
         if not with_path.is_file() and not without_path.is_file():

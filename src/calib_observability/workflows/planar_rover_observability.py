@@ -174,18 +174,20 @@ class ImportedCalibrationDataset(CalibrationSimulationDataset):
     current linearization values supplied by the caller. They are not asserted
     to be ground truth.
 
-    ``imu_rotation_residual_std`` is a factor-weighting parameter for the
-    integrated gyroscope rotation residual. It is not synthetic sample noise.
+    Raw gyro covariance is in (rad/s)^2. Each window normally converts it to
+    rotation noise [rad] using median retained sample and usable pose intervals.
 
     Attributes:
-        imu_rotation_residual_std: Standard deviation used to whiten each
-            three-dimensional gyroscope propagation residual.
+        imu_rotation_residual_std: Legacy explicit rotation-noise override [rad].
+            None derives the window value from raw gyro covariance.
     '''
 
-    imu_rotation_residual_std: float = 0.01
+    imu_rotation_residual_std: float | None = None
 
     def __post_init__(self) -> None:
         '''Validate imported-data-specific factor weighting.'''
+        if self.imu_rotation_residual_std is None:
+            return
         residual_std = float(self.imu_rotation_residual_std)
         if not np.isfinite(residual_std) or residual_std <= 0.0:
             raise ValueError(
@@ -219,24 +221,24 @@ class ImportedCalibrationDataset(CalibrationSimulationDataset):
 
         The simulation-era lower-level API names the override
         ``imu_rotation_noise_std``. Here it means the standard deviation of the
-        already-formed gyroscope rotation residual. When omitted, the dataset
-        value supplied during import is used. No measurement samples are
-        perturbed.
+        already-formed gyroscope rotation residual [rad]. With no explicit
+        override, _append_imu_factors derives its window value from raw gyro
+        covariance [(rad/s)^2] and the actual sample/factor durations.
         '''
         residual_std = (
             self.imu_rotation_residual_std
             if imu_rotation_noise_std is None
             else float(imu_rotation_noise_std)
         )
-        if not np.isfinite(residual_std) or residual_std <= 0.0:
+        if residual_std is not None and (not np.isfinite(residual_std) or residual_std <= 0.0):
             raise ValueError(
                 "imu_rotation_noise_std must be finite and positive"
             )
 
-        # This adapter is intentionally nontrivial: it injects the uncertainty
-        # model attached to the imported dataset into the simulation-era
-        # assembly API, which otherwise silently uses its hard-coded default.
-        return super().window_jacobians(
+        # The imported factor hook fills these diagnostics once usable gyro
+        # intervals are known; reset them to avoid retaining an earlier window.
+        self._window_gyro_noise_metadata = None
+        bundle, body_motions, counts = super().window_jacobians(
             start,
             end,
             pose_provider,
@@ -253,6 +255,78 @@ class ImportedCalibrationDataset(CalibrationSimulationDataset):
             fixed_extrinsic=fixed_extrinsic,
             practical_rank_policy=practical_rank_policy,
             accelerometer_options=accelerometer_options,
+        )
+        if self._window_gyro_noise_metadata is not None:
+            bundle.metadata["gyro_noise_conversion"] = self._window_gyro_noise_metadata
+        return bundle, body_motions, counts
+
+    def _append_imu_factors(
+        self, pose_times, imu_interval_indices, imu_sensor_timestamps,
+        gyroscope_samples, pose_variable_names, provider_body_poses,
+        residual_specs, residual_values, jacobian_blocks, imu_rotation_noise_std,
+        finite_difference_epsilon, jacobian_options, jacobian_check_results,
+        fixed_extrinsic,
+    ) -> int:
+        '''Convert imported rate noise once per window, then reuse gyro assembly.
+
+        Args:
+            pose_times: Actual pose timestamps [s], shape (P,).
+            imu_interval_indices: Usable consecutive-pose interval indices.
+            imu_sensor_timestamps: Retained IMU timestamps [s].
+            gyroscope_samples: Measured rates [rad/s], shape (N, 3).
+            pose_variable_names: Names of the shared pose variables.
+            provider_body_poses: Body poses, shape (P, 4, 4).
+            residual_specs: Mutable residual specifications.
+            residual_values: Mutable whitened residual values.
+            jacobian_blocks: Mutable whitened Jacobian blocks.
+            imu_rotation_noise_std: Optional legacy rotation-noise override [rad].
+            finite_difference_epsilon: Numerical derivative step.
+            jacobian_options: Shared linearization settings.
+            jacobian_check_results: Mutable derivative-check results.
+            fixed_extrinsic: Shared body-frame convention.
+
+        Returns:
+            Number of gyro factors sharing the derived window covariance.
+        '''
+        if len(imu_interval_indices) == 0:
+            return 0
+
+        # Use retained dataset sampling and only intervals accepted by assembly.
+        imu_dts = np.diff(np.asarray(self.imu.sensor_timestamps, dtype=float))
+        positive_imu_dts = imu_dts[imu_dts > 0.0]
+        factor_dts = pose_times[imu_interval_indices + 1] - pose_times[imu_interval_indices]
+        dt_imu = float(np.median(positive_imu_dts)) if positive_imu_dts.size else float("nan")
+        dt_factor = float(np.median(factor_dts))
+        if not np.isfinite([dt_imu, dt_factor]).all() or dt_imu <= 0.0 or dt_factor <= 0.0:
+            raise ValueError("Median IMU and usable gyro-factor durations must be finite and positive")
+
+        # Representative independent white-noise approximation, not exact
+        # trapezoidal propagation: (rad/s) * sqrt(s*s) = rad.
+        raw_variance = float(np.trace(self.imu.gyro_covariance) / 3.0)
+        if not np.isfinite(raw_variance) or raw_variance <= 0.0:
+            raise ValueError("Imported raw gyro covariance must have finite positive mean variance")
+        sigma_gyro = float(np.sqrt(raw_variance))
+        sigma_rotation = sigma_gyro * np.sqrt(dt_imu * dt_factor)
+        if imu_rotation_noise_std is not None:
+            sigma_rotation = float(imu_rotation_noise_std)
+        if not np.isfinite(sigma_rotation) or sigma_rotation <= 0.0:
+            raise ValueError("Window gyro rotation residual standard deviation must be finite and positive")
+        self._window_gyro_noise_metadata = {
+            "raw_gyro_sigma_radps": sigma_gyro,
+            "median_imu_dt_s": dt_imu,
+            "median_gyro_factor_dt_s": dt_factor,
+            "imu_rotation_residual_std_rad": float(sigma_rotation),
+            "explicit_rotation_std_override": imu_rotation_noise_std is not None,
+        }
+
+        # The parent integrates unchanged and whitens every gyro residual with
+        # sigma_rotation**2 * I_3. Simulation never enters this imported hook.
+        return super()._append_imu_factors(
+            pose_times, imu_interval_indices, imu_sensor_timestamps,
+            gyroscope_samples, pose_variable_names, provider_body_poses,
+            residual_specs, residual_values, jacobian_blocks, sigma_rotation,
+            finite_difference_epsilon, jacobian_options, jacobian_check_results,
+            fixed_extrinsic,
         )
 
 
@@ -626,8 +700,8 @@ def build_dataset_from_imported_sensor_streams(
         gyro_bias_initial: Initial gyroscope bias linearization.
         tau_I_initial: Current IMU sensor-to-reference clock offset.
         tau_L_initial: Current LiDAR sensor-to-reference clock offset.
-        gyro_noise_std: Legacy covariance fallback standard deviation. No noise
-            is added to gyroscope samples.
+        gyro_noise_std: Raw angular-rate measurement standard deviation [rad/s]
+            used when gyro_covariance is absent. No noise is added to samples.
         accel_noise_std: Legacy covariance fallback standard deviation. No noise
             is added to accelerometer samples.
         lidar_pose_noise_std: Legacy covariance fallback standard deviation. No
@@ -637,12 +711,12 @@ def build_dataset_from_imported_sensor_streams(
             to correct the external odometry convention.
         start_time: Optional analysis start in the common reference clock.
         end_time: Optional analysis end in the common reference clock.
-        gyro_covariance: Optional explicit gyroscope covariance, shape `(3, 3)`.
+        gyro_covariance: Optional raw gyro covariance [(rad/s)^2], shape `(3, 3)`.
         accel_covariance: Optional explicit accelerometer covariance, shape `(3, 3)`.
         lidar_covariances: Optional LiDAR covariance, shape `(6, 6)` or `(M, 6, 6)`.
-        imu_rotation_residual_std: Optional standard deviation of the
-            integrated gyroscope rotation residual. When omitted, the
-            legacy ``gyro_noise_std`` value is used as the factor weight.
+        imu_rotation_residual_std: Legacy explicit rotation-noise override [rad].
+            When omitted, each window derives rotation noise from raw gyro
+            covariance and median IMU/usable gyro-factor durations.
 
     Returns:
         A ``CalibrationSimulationDataset`` compatible with the existing lower
@@ -870,12 +944,8 @@ def build_dataset_from_imported_sensor_streams(
     if not np.all(np.isfinite(gyro_bias)):
         raise ValueError("gyro_bias_initial must be finite")
 
-    residual_std = (
-        float(gyro_noise_std)
-        if imu_rotation_residual_std is None
-        else float(imu_rotation_residual_std)
-    )
-    if not np.isfinite(residual_std) or residual_std <= 0.0:
+    residual_std = None if imu_rotation_residual_std is None else float(imu_rotation_residual_std)
+    if residual_std is not None and (not np.isfinite(residual_std) or residual_std <= 0.0):
         raise ValueError(
             "imu_rotation_residual_std must be finite and positive"
         )

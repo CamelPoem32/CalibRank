@@ -76,6 +76,16 @@ an error with the subprocess diagnostics.
 
 ## Parallel Analysis
 
+Gyro weighting for imported data uses one representative rotation standard
+deviation per window: raw gyro sigma [rad/s] times
+sqrt(median retained IMU dt * median usable gyro pose-interval dt).
+Raw sigma comes from sqrt(trace(gyro_covariance) / 3). The resulting sigma [rad]
+is squared to weight every gyro rotation residual in that window. This is a
+simple independent white-noise approximation, not exact sample propagation.
+The four quantities are recorded in each bundle's `gyro_noise_conversion`
+metadata and `run_summary.json` under `gyro_noise_windows`; verbosity 2 prints
+them too. Simulation weighting and accelerometer/LiDAR covariances are unchanged.
+
 Pass `--n-processes 4 --verbose 1` to analyze windows in a four-process pool.
 The default `--n-processes 1` keeps sequential execution. The analysis progress
 bar counts completed windows out of the total retained window count, regardless
